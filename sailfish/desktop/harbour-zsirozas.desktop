@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=Zsírozás
+Icon=harbour-zsirozas
+Exec=harbour-zsirozas
+Type=Application
+Categories=Game;
+X-Sailfish-ApplicationType=Silica
+
+[X-Sailjail]
+Sandboxing=Disabled
