@@ -46,6 +46,7 @@ class GameEngine : public QObject {
     // In that case the player may either play a hitting card OR tap "Let it go".
     Q_PROPERTY(bool playerCanPass READ playerCanPass NOTIFY playerCanPassChanged)
     Q_PROPERTY(bool playerInputEnabled READ playerInputEnabled NOTIFY stateChanged)
+    Q_PROPERTY(int currentTargetRank READ currentTargetRank NOTIFY stateChanged)
 
 public:
     explicit GameEngine(QObject* parent=nullptr);
@@ -75,6 +76,7 @@ public:
     Q_INVOKABLE void newGame();
     Q_INVOKABLE void playCard(int handIndex);
     Q_INVOKABLE void playerPass();
+    int currentTargetRank() const;
 
 signals:
     void stateChanged();
@@ -124,7 +126,6 @@ private:
     void refillHands(Winner firstDraws);
     static QVariantList toVariantList(const QVector<Card>& v);
 
-    bool isHit(const Card& prev, const Card& cur) const;
     bool handHasLegalHit(const QVector<Card>& hand) const;
 
     void applyMove(Turn who, int handIndex);
@@ -159,6 +160,4 @@ private:
     bool handHasNonHit(const QVector<Card>& hand) const;
     void normalizeTurnIfHandEmpty();
     int responseTargetRank() const;
-    int pileRank() const;
-    int m_pileRank = 0; 
 };

@@ -24,9 +24,13 @@ QVariantList GameEngine::toVariantList(const QVector<Card>& v)
     return out;
 }
 
-int GameEngine::pileRank() const
-{
-    return table.isEmpty() ? 0 : table.first().rank;
+int GameEngine::currentTargetRank() const {
+    if (table.isEmpty()) return -1;
+    if (table.size() == 1) return table.last().rank;
+    const Card& prev = table[table.size() - 2];
+    const Card& cur  = table.last();
+    if (cur.rank == 7) return prev.rank;
+    return cur.rank;
 }
 
 GameEngine::GameEngine(QObject* parent) : QObject(parent)
@@ -34,18 +38,25 @@ GameEngine::GameEngine(QObject* parent) : QObject(parent)
     m_aiTimer.setSingleShot(true);
     m_pileTimer.setSingleShot(true);
 
-//    connect(&m_aiTimer, &QTimer::timeout, this, [this]() {
-//        if (m_turn != Turn::Cpu) return;
-//        if (!m_roundResult.isEmpty()) return;
-//        if (m_pilePending) return;           // must not act during pending capture
-//        applyMove(Turn::Cpu, chooseCpuIndex());
-//    });
     connect(&m_aiTimer, &QTimer::timeout, this, [this]() {
         if (m_turn != Turn::Cpu) return;
         if (!m_roundResult.isEmpty()) return;
-        if (m_pilePending) return;   // do not play during pending capture
-        if (cpu.isEmpty()) return;   // safety
-        applyMove(Turn::Cpu, chooseCpuIndex());
+        if (m_pilePending) return;
+        if (cpu.isEmpty()) return;
+
+        const int idx = chooseCpuIndex();
+        if (idx < 0) {
+            // CPU cannot respond to a hit -> end pile, last hitter wins
+            m_pilePending = true;
+            m_pendingWinner = m_lastHitter;
+            m_inputLocked = true;
+            m_playerCanPass = false;
+            emit playerCanPassChanged();
+            emit stateChanged();
+            resolvePileAfterDelay();
+            return;
+        }
+        applyMove(Turn::Cpu, idx);
     });
 
     connect(&m_pileTimer, &QTimer::timeout, this, [this]() {
@@ -69,19 +80,15 @@ void GameEngine::normalizeTurnIfHandEmpty()
     }
 }
 
-bool GameEngine::handHasNonHit(const QVector<Card>& hand) const
-{
-    if (table.isEmpty())
-        return false;
-
+bool GameEngine::handHasNonHit(const QVector<Card>& hand) const {
+    const int target = responseTargetRank();
+    if (target < 0) return false;
     for (const Card& c : hand) {
-        const bool isHitCard = (c.rank == m_pileRank || c.rank == 7);
-        if (!isHitCard)
-            return true;
+        const bool isHitCard = (c.rank == target || c.rank == 7);
+        if (!isHitCard) return true;
     }
     return false;
 }
-
 
 void GameEngine::cancelPendingActions()
 {
@@ -221,12 +228,6 @@ void GameEngine::refillHands(Winner firstDraws)
     }
 }
 
-bool GameEngine::isHit(const Card& /*prev*/, const Card& cur) const
-{
-    // A hit is either: same rank as the pile rank, OR a 7 (wild).
-    return (cur.rank == m_pileRank) || (cur.rank == 7);
-}
-
 int GameEngine::responseTargetRank() const
 {
     if (table.isEmpty())
@@ -244,14 +245,11 @@ int GameEngine::responseTargetRank() const
     return cur.rank;
 }
 
-bool GameEngine::handHasLegalHit(const QVector<Card>& hand) const
-{
-    if (table.isEmpty())
-        return false;
-
+bool GameEngine::handHasLegalHit(const QVector<Card>& hand) const {
+    const int target = responseTargetRank();
+    if (target < 0) return false;
     for (const Card& c : hand) {
-        if (c.rank == m_pileRank || c.rank == 7)
-            return true;
+        if (c.rank == target || c.rank == 7) return true;
     }
     return false;
 }
@@ -277,8 +275,7 @@ void GameEngine::updatePlayerCanPass()
         const Card& cur  = table.last();
 
         const bool lastByCpu  = (cur.playedBy == 1);
-//-        const bool lastWasHit = lastByCpu && isHit(prev, cur);
-        const bool lastWasHit = lastByCpu && (cur.rank == pileRank() || cur.rank == 7);
+        const bool lastWasHit = (m_lastMoveBy == Turn::Cpu) && m_lastMoveWasHit;
 
         if (lastWasHit && handHasLegalHit(player))
             can = true;
@@ -308,7 +305,6 @@ void GameEngine::newGame()
     m_playerWon.clear();
     m_cpuWon.clear();
     table.clear();
-    m_pileRank = 0;
     player.clear();
     cpu.clear();
     m_lastTrick.clear();
@@ -354,7 +350,7 @@ void GameEngine::playCard(int handIndex)
         if (handIndex < 0 || handIndex >= player.size())
             return;
 
-        const int targetRank = m_pileRank;
+        const int targetRank = currentTargetRank();
         const Card& candidate = player[handIndex];
         const bool legalHit = (candidate.rank == targetRank || candidate.rank == 7);
         if (!legalHit)
@@ -421,91 +417,71 @@ void GameEngine::capturePile(Winner winner)
     }
 
     table.clear();
-    m_pileRank = 0;
     refillHands(winner);
 
     emit scoreChanged();
     emit lastTrickChanged();
 }
 
-void GameEngine::applyMove(Turn who, int handIndex)
-{
+void GameEngine::applyMove(Turn who, int handIndex) {
     QVector<Card>& hand = (who == Turn::Player) ? player : cpu;
-    if (handIndex < 0 || handIndex >= hand.size())
-        return;
+    if (handIndex < 0 || handIndex >= hand.size()) return;
 
-    // Any real move cancels any previously scheduled capture (stale timer).
+    // Target to respond to is defined by the table BEFORE this play.
+    const int targetBeforePlay = responseTargetRank();
+
     m_pileTimer.stop();
     m_pilePending = false;
-
-    // Stop AI timer to avoid double-plays.
     m_aiTimer.stop();
 
     Card played = hand.takeAt(handIndex);
     played.playedBy = (who == Turn::Cpu) ? 1 : 0;
     table.append(played);
 
-    qDebug() << "[applyMove]"
-             << (who == Turn::Player ? "Player" : "CPU")
-             << "played" << played.rank
-             << "tableSizeNow=" << table.size();
+    qDebug() << "[applyMove]" << (who == Turn::Player ? "Player" : "CPU")
+             << "played" << played.rank << "tableSizeNow=" << table.size();
 
-    // First card: establish last hitter (leader) and hand over turn to the other side.
+    // First card: establishes leader; no "hit" concept here.
     if (table.size() == 1) {
         m_lastHitter = (who == Turn::Player) ? Winner::Player : Winner::Cpu;
         m_turn = (who == Turn::Player) ? Turn::Cpu : Turn::Player;
 
+        // Optional: record last move semantics (not strictly needed for first card)
+        m_lastMoveBy = who;
+        m_lastMoveWasHit = false;
+
         updatePlayerCanPass();
         emit stateChanged();
-        m_pileRank = played.rank;
         if (m_turn == Turn::Cpu) maybeScheduleCpuMove();
         return;
     }
 
-
-
-    // From the second card onward, compute hit.
-    const Card& prev = table[table.size() - 2];
-    const Card& cur  = table.last();
-    const bool hit = isHit(prev, cur);
-
+    // From the second card onward: a hit matches the previous target, or is a 7.
+    const bool hit = (played.rank == targetBeforePlay) || (played.rank == 7);
     m_lastMoveBy = who;
     m_lastMoveWasHit = hit;
 
     if (hit) {
-        // Hitter becomes last hitter.
         m_lastHitter = (who == Turn::Player) ? Winner::Player : Winner::Cpu;
-
-        // Turn ALWAYS passes to the other player after any played card.
         m_turn = (who == Turn::Player) ? Turn::Cpu : Turn::Player;
 
         updatePlayerCanPass();
         emit stateChanged();
 
-        // If player must respond to a CPU hit, maybe schedule auto resolution *only if*
-        // player has NO legal hit. (Your current maybeAutoPassIfNeeded() may be no-op; that's fine.)
         maybeAutoPassIfNeeded();
-
-        if (m_turn == Turn::Cpu)
-            maybeScheduleCpuMove();
-
+        if (m_turn == Turn::Cpu) maybeScheduleCpuMove();
         return;
     }
 
-    // NOT a hit:
-    // By your rules, the pile is captured by the last hitter.
-    // That is m_lastHitter (set on first card, and updated on every hit).
+    // Non-hit: pile ends, last hitter wins (your current rule)
     m_pilePending = true;
     m_pendingWinner = m_lastHitter;
     m_inputLocked = true;
     m_playerCanPass = false;
-    emit playerCanPassChanged();	
+    emit playerCanPassChanged();
 
-    // After a non-hit, nobody plays more into this pile. It ends.
-    // Next leader is decided in commitPile() after capturePile() sets m_lastPileWinner.
-    updatePlayerCanPass();   // should go false
+    updatePlayerCanPass();
     emit stateChanged();
-
     resolvePileAfterDelay();
 }
 
@@ -518,7 +494,7 @@ int GameEngine::chooseCpuIndex() const
     if (table.isEmpty())
         return 0;
 
-    const int targetRank = m_pileRank;
+    const int targetRank = currentTargetRank();
 
     // If CPU can hit, do it (match or 7)
     for (int i = 0; i < cpu.size(); ++i) {
@@ -527,8 +503,8 @@ int GameEngine::chooseCpuIndex() const
             return i;
     }
 
-    // Cannot hit -> play any card as concession.
-    return 0;
+    // Cannot hit -> no move; pile should be captured by last hitter.
+    return -1;
 }
 
 bool GameEngine::isGameOverCondition() const
