@@ -235,7 +235,7 @@ enabled: engine.playerCanPass
                                 // When "Let it go" is visible, only allow HIT cards
                                 enabled: engine.playerInputEnabled &&
                                          (!engine.playerCanPass ||
-                                          modelData.rank === engine.tableCards[engine.tableCards.length - 1].rank ||
+                                          modelData.rank === engine.tableCards[0].rank ||
                                           modelData.rank === 7)
 
                                 onClicked: engine.playCard(index)

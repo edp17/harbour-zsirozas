@@ -354,7 +354,7 @@ void GameEngine::playCard(int handIndex)
         if (handIndex < 0 || handIndex >= player.size())
             return;
 
-        const int targetRank = table.last().rank;
+        const int targetRank = m_pileRank;
         const Card& candidate = player[handIndex];
         const bool legalHit = (candidate.rank == targetRank || candidate.rank == 7);
         if (!legalHit)
@@ -457,9 +457,12 @@ void GameEngine::applyMove(Turn who, int handIndex)
 
         updatePlayerCanPass();
         emit stateChanged();
+        m_pileRank = played.rank;
         if (m_turn == Turn::Cpu) maybeScheduleCpuMove();
         return;
     }
+
+
 
     // From the second card onward, compute hit.
     const Card& prev = table[table.size() - 2];
@@ -494,6 +497,9 @@ void GameEngine::applyMove(Turn who, int handIndex)
     // That is m_lastHitter (set on first card, and updated on every hit).
     m_pilePending = true;
     m_pendingWinner = m_lastHitter;
+    m_inputLocked = true;
+    m_playerCanPass = false;
+    emit playerCanPassChanged();	
 
     // After a non-hit, nobody plays more into this pile. It ends.
     // Next leader is decided in commitPile() after capturePile() sets m_lastPileWinner.
@@ -512,7 +518,7 @@ int GameEngine::chooseCpuIndex() const
     if (table.isEmpty())
         return 0;
 
-    const int targetRank = table.last().rank;
+    const int targetRank = m_pileRank;
 
     // If CPU can hit, do it (match or 7)
     for (int i = 0; i < cpu.size(); ++i) {
@@ -558,5 +564,8 @@ void GameEngine::finishGame()
 
 bool GameEngine::playerInputEnabled() const
 {
-    return m_roundResult.isEmpty() && (m_turn == Turn::Player) && !m_inputLocked;
+    return m_roundResult.isEmpty()
+        && (m_turn == Turn::Player)
+        && !m_inputLocked
+        && !m_pilePending;
 }
