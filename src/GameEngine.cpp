@@ -46,14 +46,8 @@ GameEngine::GameEngine(QObject* parent) : QObject(parent)
 
         const int idx = chooseCpuIndex();
         if (idx < 0) {
-            // CPU cannot respond to a hit -> end pile, last hitter wins
-            m_pilePending = true;
-            m_pendingWinner = m_lastHitter;
-            m_inputLocked = true;
-            m_playerCanPass = false;
-            emit playerCanPassChanged();
-            emit stateChanged();
-            resolvePileAfterDelay();
+            // AI cannot respond -> AI takes the pile
+            scheduleTakePile(Winner::Cpu);
             return;
         }
         applyMove(Turn::Cpu, idx);
@@ -106,6 +100,42 @@ void GameEngine::resolvePileAfterDelay()
     m_aiTimer.stop();            // IMPORTANT: cancel any already scheduled CPU move
     m_pileTimer.stop();
     m_pileTimer.start(m_pileDelayMs);
+}
+
+void GameEngine::scheduleTakePile(Winner taker)
+{
+    // Taking the pile ends the exchange immediately.
+    cancelPendingActions();
+
+    m_playerCanPass = false;
+    emit playerCanPassChanged();
+
+    m_pilePending = true;
+    m_pendingWinner = taker;
+
+    m_inputLocked = true;
+    emit stateChanged();
+
+    resolvePileAfterDelay();
+}
+
+bool GameEngine::autoTakeIfNoHit()
+{
+    if (table.isEmpty())
+        return false;
+
+    if (m_turn == Turn::Player) {
+        if (!handHasLegalHit(player)) {
+            scheduleTakePile(Winner::Player);
+            return true;
+        }
+    } else {
+        if (!handHasLegalHit(cpu)) {
+            scheduleTakePile(Winner::Cpu);
+            return true;
+        }
+    }
+    return false;
 }
 
 void GameEngine::commitPile()
@@ -377,18 +407,7 @@ void GameEngine::playerPass()
     if (!m_playerCanPass || m_inputLocked)
         return;
 
-    m_aiTimer.stop();
-
-    m_playerCanPass = false;
-    emit playerCanPassChanged();
-
-    m_pilePending = true;
-    m_pendingWinner = m_lastHitter;
-
-    m_inputLocked = true;   // lock only while waiting for commitPile
-
-    resolvePileAfterDelay();
-    emit stateChanged();
+    scheduleTakePile(Winner::Player);
 }
 
 void GameEngine::capturePile(Winner winner)
@@ -446,13 +465,18 @@ void GameEngine::applyMove(Turn who, int handIndex) {
         m_lastHitter = (who == Turn::Player) ? Winner::Player : Winner::Cpu;
         m_turn = (who == Turn::Player) ? Turn::Cpu : Turn::Player;
 
-        // Optional: record last move semantics (not strictly needed for first card)
         m_lastMoveBy = who;
         m_lastMoveWasHit = false;
 
         updatePlayerCanPass();
         emit stateChanged();
-        if (m_turn == Turn::Cpu) maybeScheduleCpuMove();
+
+        // if responder cannot hit, responder takes immediately
+        if (autoTakeIfNoHit())
+        return;
+
+        if (m_turn == Turn::Cpu)
+            maybeScheduleCpuMove();
         return;
     }
 
@@ -468,7 +492,11 @@ void GameEngine::applyMove(Turn who, int handIndex) {
         updatePlayerCanPass();
         emit stateChanged();
 
-        maybeAutoPassIfNeeded();
+        // if next player cannot respond, they take immediately
+        if (autoTakeIfNoHit())
+            return;
+
+//        maybeAutoPassIfNeeded();
         if (m_turn == Turn::Cpu) maybeScheduleCpuMove();
         return;
     }

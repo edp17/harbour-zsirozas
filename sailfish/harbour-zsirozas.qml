@@ -191,8 +191,7 @@ ApplicationWindow
                         anchors.horizontalCenter: parent.horizontalCenter
                         text: qsTr("Let it go")
                         visible: engine.playerCanPass
-//-                        enabled: (engine.playerCanPass && engine.playerInputEnabled)
-enabled: engine.playerCanPass
+                        enabled: engine.playerCanPass && engine.playerInputEnabled
                         onClicked: engine.playerPass()
                     }
 
@@ -234,7 +233,7 @@ enabled: engine.playerCanPass
 
                                 // When "Let it go" is visible, only allow HIT cards
                                 enabled: engine.playerInputEnabled &&
-                                         (!engine.playerCanPass ||
+                                         (engine.tableCards.length === 0 ||
                                           modelData.rank === engine.currentTargetRank ||
                                           modelData.rank === 7)
 
