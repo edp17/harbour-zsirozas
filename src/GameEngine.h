@@ -160,6 +160,4 @@ private:
     bool handHasNonHit(const QVector<Card>& hand) const;
     void normalizeTurnIfHandEmpty();
     int responseTargetRank() const;
-    void scheduleTakePile(Winner taker);
-    bool autoTakeIfNoHit();
 };

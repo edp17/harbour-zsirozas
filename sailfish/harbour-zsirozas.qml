@@ -231,11 +231,7 @@ ApplicationWindow
                                 width: Theme.itemSizeLarge
                                 height: Theme.itemSizeLarge * 1.4
 
-                                // When "Let it go" is visible, only allow HIT cards
-                                enabled: engine.playerInputEnabled &&
-                                         (engine.tableCards.length === 0 ||
-                                          modelData.rank === engine.currentTargetRank ||
-                                          modelData.rank === 7)
+                                enabled: engine.playerInputEnabled
 
                                 onClicked: engine.playCard(index)
 

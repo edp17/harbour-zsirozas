@@ -45,11 +45,7 @@ GameEngine::GameEngine(QObject* parent) : QObject(parent)
         if (cpu.isEmpty()) return;
 
         const int idx = chooseCpuIndex();
-        if (idx < 0) {
-            // AI cannot respond -> AI takes the pile
-            scheduleTakePile(Winner::Cpu);
-            return;
-        }
+        if (idx < 0) return; // only when cpu.isEmpty()
         applyMove(Turn::Cpu, idx);
     });
 
@@ -100,42 +96,6 @@ void GameEngine::resolvePileAfterDelay()
     m_aiTimer.stop();            // IMPORTANT: cancel any already scheduled CPU move
     m_pileTimer.stop();
     m_pileTimer.start(m_pileDelayMs);
-}
-
-void GameEngine::scheduleTakePile(Winner taker)
-{
-    // Taking the pile ends the exchange immediately.
-    cancelPendingActions();
-
-    m_playerCanPass = false;
-    emit playerCanPassChanged();
-
-    m_pilePending = true;
-    m_pendingWinner = taker;
-
-    m_inputLocked = true;
-    emit stateChanged();
-
-    resolvePileAfterDelay();
-}
-
-bool GameEngine::autoTakeIfNoHit()
-{
-    if (table.isEmpty())
-        return false;
-
-    if (m_turn == Turn::Player) {
-        if (!handHasLegalHit(player)) {
-            scheduleTakePile(Winner::Player);
-            return true;
-        }
-    } else {
-        if (!handHasLegalHit(cpu)) {
-            scheduleTakePile(Winner::Cpu);
-            return true;
-        }
-    }
-    return false;
 }
 
 void GameEngine::commitPile()
@@ -373,20 +333,6 @@ void GameEngine::playCard(int handIndex)
     if (!playerInputEnabled())
         return;
 
-    // Validate "must-hit" constraint BEFORE locking
-    if (m_playerCanPass) {
-        if (table.isEmpty())
-            return;
-        if (handIndex < 0 || handIndex >= player.size())
-            return;
-
-        const int targetRank = currentTargetRank();
-        const Card& candidate = player[handIndex];
-        const bool legalHit = (candidate.rank == targetRank || candidate.rank == 7);
-        if (!legalHit)
-            return;
-    }
-
     m_inputLocked = true;
     emit stateChanged();
 
@@ -407,7 +353,16 @@ void GameEngine::playerPass()
     if (!m_playerCanPass || m_inputLocked)
         return;
 
-    scheduleTakePile(Winner::Player);
+    m_aiTimer.stop();
+    m_playerCanPass = false;
+    emit playerCanPassChanged();
+
+    m_pilePending = true;
+    m_pendingWinner = m_lastHitter;   // concede to last hitter
+    m_inputLocked = true;
+
+    resolvePileAfterDelay();
+    emit stateChanged();
 }
 
 void GameEngine::capturePile(Winner winner)
@@ -471,10 +426,6 @@ void GameEngine::applyMove(Turn who, int handIndex) {
         updatePlayerCanPass();
         emit stateChanged();
 
-        // if responder cannot hit, responder takes immediately
-        if (autoTakeIfNoHit())
-        return;
-
         if (m_turn == Turn::Cpu)
             maybeScheduleCpuMove();
         return;
@@ -491,10 +442,6 @@ void GameEngine::applyMove(Turn who, int handIndex) {
 
         updatePlayerCanPass();
         emit stateChanged();
-
-        // if next player cannot respond, they take immediately
-        if (autoTakeIfNoHit())
-            return;
 
 //        maybeAutoPassIfNeeded();
         if (m_turn == Turn::Cpu) maybeScheduleCpuMove();
@@ -531,8 +478,13 @@ int GameEngine::chooseCpuIndex() const
             return i;
     }
 
-    // Cannot hit -> no move; pile should be captured by last hitter.
-    return -1;
+    // Cannot hit -> play a non-hit card if possible, otherwise any card
+    for (int i = 0; i < cpu.size(); ++i) {
+        const Card& c = cpu[i];
+        if (!(c.rank == targetRank || c.rank == 7))
+            return i;
+    }
+    return 0;
 }
 
 bool GameEngine::isGameOverCondition() const
