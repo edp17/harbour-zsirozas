@@ -1,163 +1,174 @@
 #pragma once
+
 #include <QObject>
 #include <QVector>
-#include <QString>
 #include <QVariantList>
-#include <QMetaType>
 #include <QTimer>
+#include <QString>
 
-// Hungarian "Zsírozás" (2-player) simplified engine:
-// - 4 cards in hand, draw from talon back to 4 after each pile capture
-// - "Hit" with same rank OR any 7
-// - If you can hit, you may either hit OR "Let it go" (pass) -> last hitter captures the pile
-// - If you cannot hit when it's your obligation to respond, engine auto-passes for you
-// - Scoring: 10s and Aces are worth 10 points each (total 80)
-
-struct Card {
-    int rank = 0;
-    int suit = 0;
-    int playedBy = -1; // 0=player, 1=cpu (only meaningful for table layout)
-    QString id() const { return QString("%1_%2").arg(suit).arg(rank); }
-    bool isZsir() const { return rank == 10 || rank == 14; }
-};
-
-Q_DECLARE_METATYPE(Card)
-
-class GameEngine : public QObject {
+class GameEngine : public QObject
+{
     Q_OBJECT
 
+    // Existing UI properties used by your QML
     Q_PROPERTY(QString status READ status NOTIFY statusChanged)
     Q_PROPERTY(QString lastTrick READ lastTrick NOTIFY lastTrickChanged)
-    Q_PROPERTY(int playerScore READ playerScore NOTIFY scoreChanged)
-    Q_PROPERTY(int cpuScore READ cpuScore NOTIFY scoreChanged)
     Q_PROPERTY(QString roundResult READ roundResult NOTIFY roundResultChanged)
 
-    Q_PROPERTY(QVariantList cpuHand READ cpuHand NOTIFY stateChanged)
-    Q_PROPERTY(QVariantList playerHand READ playerHand NOTIFY stateChanged)
-    Q_PROPERTY(QVariantList tableCards READ tableCards NOTIFY stateChanged)
     Q_PROPERTY(int deckSize READ deckSize NOTIFY stateChanged)
+    Q_PROPERTY(int playerScore READ playerScore NOTIFY scoreChanged)
+    Q_PROPERTY(int cpuScore READ cpuScore NOTIFY scoreChanged)
 
+    Q_PROPERTY(QVariantList playerHand READ playerHand NOTIFY stateChanged)
+    Q_PROPERTY(QVariantList cpuHand READ cpuHand NOTIFY stateChanged)
+    Q_PROPERTY(QVariantList tableCards READ tableCards NOTIFY stateChanged)
     Q_PROPERTY(QVariantList playerWonCards READ playerWonCards NOTIFY stateChanged)
     Q_PROPERTY(QVariantList cpuWonCards READ cpuWonCards NOTIFY stateChanged)
 
     Q_PROPERTY(int aiPlayDelay READ aiPlayDelay WRITE setAiPlayDelay NOTIFY aiPlayDelayChanged)
 
-    // True only when it is the player's turn to respond to a CPU hit and the player has a legal hit.
-    // In that case the player may either play a hitting card OR tap "Let it go".
-    Q_PROPERTY(bool playerCanPass READ playerCanPass NOTIFY playerCanPassChanged)
+    // New rule-state properties (0v-style)
+    Q_PROPERTY(int cardToHit READ cardToHit NOTIFY stateChanged)
+    Q_PROPERTY(bool haveToMove READ haveToMove NOTIFY stateChanged)
+    Q_PROPERTY(bool canLeave READ canLeave NOTIFY stateChanged)
+
+    // Kept for compatibility with your current QML button wiring
+    // (we’ll map it to canLeave)
+    Q_PROPERTY(bool playerCanPass READ canLeave NOTIFY stateChanged)
+
     Q_PROPERTY(bool playerInputEnabled READ playerInputEnabled NOTIFY stateChanged)
-    Q_PROPERTY(int currentTargetRank READ currentTargetRank NOTIFY stateChanged)
+    Q_PROPERTY(bool allowLeave READ allowLeave CONSTANT)
 
 public:
-    explicit GameEngine(QObject* parent=nullptr);
+    explicit GameEngine(QObject* parent = nullptr);
 
-    // Lists exposed to QML
+    enum class Turn { Player, Cpu };
+    Q_ENUM(Turn)
+
+    enum class Winner { Player, Cpu };
+    Q_ENUM(Winner)
+
+    struct Card {
+        int rank = 0;      // 7..14 (Ace=14)
+        int suit = 0;      // 0..3
+        int playedBy = -1; // 0 player, 1 cpu, -1 not on table
+
+        QString id() const { return QString::number(suit) + "_" + QString::number(rank); }
+        bool isZsir() const { return (rank == 10 || rank == 14); } // 10/A = 10 points each
+    };
+
+    // Actions
+    Q_INVOKABLE void newGame();
+    Q_INVOKABLE void playCard(int handIndex);
+
+    // “Let it go” in UI – in 0v this is “leave / don’t want to move” and awards pile to last hitter.
+    Q_INVOKABLE void playerLeave();
+    // Backward name kept so you don’t have to change QML call sites if you don’t want to.
+    Q_INVOKABLE void playerPass() { playerLeave(); }
+
+    // Read-only getters
+    QString status() const { return m_status; }
+    QString lastTrick() const { return m_lastTrick; }
+    QString roundResult() const { return m_roundResult; }
+
+    int deckSize() const { return m_talon.size(); }
+    int playerScore() const { return m_playerPoints; }
+    int cpuScore() const { return m_cpuPoints; }
+
     QVariantList playerHand() const;
     QVariantList cpuHand() const;
     QVariantList tableCards() const;
     QVariantList playerWonCards() const;
     QVariantList cpuWonCards() const;
 
-    // Values exposed to QML
-    QString status() const;
-    QString lastTrick() const;
-    int playerScore() const;
-    int cpuScore() const;
-    QString roundResult() const;
-    int deckSize() const;
-
     int aiPlayDelay() const { return m_aiPlayDelay; }
     void setAiPlayDelay(int ms);
 
-    bool playerCanPass() const { return m_playerCanPass; }
+    int cardToHit() const { return m_cardToHit; }
+    bool haveToMove() const { return m_haveToMove; }
+    bool canLeave() const;
+
     bool playerInputEnabled() const;
 
-    // QML actions
-    Q_INVOKABLE void newGame();
-    Q_INVOKABLE void playCard(int handIndex);
-    Q_INVOKABLE void playerPass();
-    int currentTargetRank() const;
-
 signals:
-    void stateChanged();
     void statusChanged();
     void lastTrickChanged();
-    void scoreChanged();
     void roundResultChanged();
+    void scoreChanged();
     void aiPlayDelayChanged();
-    void playerCanPassChanged();
+    void stateChanged();
 
 private:
-    enum class Turn { Player, Cpu };
-    enum class Winner { Player, Cpu };
+    // State machine helpers
+    void initDeck();
+    void refillHands(Winner firstDraws);
 
-    // Core state
-    QVector<Card> talon;
-    QVector<Card> player;
-    QVector<Card> cpu;
-    QVector<Card> table;
+    static QVariantList toVariantList(const QVector<Card>& v);
+
+    bool isHitRank(int rank) const;
+    bool handHasHitCard(const QVector<Card>& hand) const;
+
+    void applyMove(Turn who, int handIndex);
+    void advanceAfterPlay(Turn whoJustPlayed, int playedRank);
+
+    void scheduleRoundWin(Winner winner);
+    void resolvePileAfterDelay();
+    void commitPile();
+
+    void capturePile(Winner winner);
+    void startNextPileWithLeader(Winner leader);
+
+    void maybeScheduleCpuMove();
+    int  chooseCpuIndex() const;
+
+    void updateStatusText();
+
+    bool isGameOverCondition() const;
+    void finishGame();
+
+private:
+    // Cards
+    QVector<Card> m_talon;
+    QVector<Card> m_player;
+    QVector<Card> m_cpu;
+    QVector<Card> m_table;
     QVector<Card> m_playerWon;
     QVector<Card> m_cpuWon;
 
-    Turn   m_turn = Turn::Player;
-    Winner m_lastHitter = Winner::Player;     // last successful hitter (also set by leader's first card)
-    Winner m_lastPileWinner = Winner::Player; // used for 40-40 tie
-    bool   m_playerCanPass = false;
-    bool   m_inputLocked = false; // debounce / input lock
-    bool   m_pilePending = false;
-    Winner m_pendingWinner = Winner::Player;
+    // Scores
+    int m_playerPoints = 0;
+    int m_cpuPoints = 0;
 
-    // Scoring and messages
-    int player_points = 0;
-    int cpu_points = 0;
+    // UI text
     QString m_status;
     QString m_lastTrick;
     QString m_roundResult;
 
-    // AI timing
-    int m_aiPlayDelay = 650;
+    // Turn
+    Turn m_turn = Turn::Player;
 
-    // "7 as last card loses" tracking (rule from common Zsírozás rulesets)
-    bool   m_lastPlayedWasSeven = false;
-    Turn   m_lastPlayedBy = Turn::Player;
+    // 0v-style pile state
+    int  m_cardToHit = -1;              // rank of first card of pile
+    bool m_haveToMove = true;           // forced-hit phase (true) vs starter decision phase (false)
+    int  m_movesInPile = 0;             // number of played cards in current pile
+    Turn m_roundStarter = Turn::Player; // who led pile
+    Winner m_lastHitter = Winner::Player;
 
-    // Helpers
-    void initDeck();
-    void refillHands(Winner firstDraws);
-    static QVariantList toVariantList(const QVector<Card>& v);
+    // Pending capture (delay)
+    bool   m_pilePending = false;
+    Winner m_pendingWinner = Winner::Player;
+    bool   m_inputLocked = false;
 
-    bool handHasLegalHit(const QVector<Card>& hand) const;
-
-    void applyMove(Turn who, int handIndex);
-    void resolveAfterMove(bool lastMoveWasHit);
-    void capturePile(Winner winner);
-
-    void updatePlayerCanPass();
-    void maybeAutoPassIfNeeded();
-    void maybeScheduleCpuMove();
-    int  chooseCpuIndex() const;
-
-    bool isGameOverCondition() const;
-    void finishGame();
-    int m_pileDelayMs = 400;
-    // pile resolution
-    void resolvePileAfterDelay();
-    void commitPile();
-    bool m_pileResolving = false;
-
-    // Track last move semantics (so UI/logic doesn't infer it from table timing)
-    Turn m_lastMoveBy = Turn::Player;
-    bool m_lastMoveWasHit = false;
-
-    // Auto-capture scheduling (prevents premature/stale capture)
-    bool m_captureScheduled = false;
-    Winner m_scheduledWinner = Winner::Player;
-
+    // Timers / delays
     QTimer m_aiTimer;
     QTimer m_pileTimer;
-    void cancelPendingActions();
+    int    m_aiPlayDelay = 1500;
+    int    m_pileDelayMs = 400;
 
-    bool handHasNonHit(const QVector<Card>& hand) const;
-    void normalizeTurnIfHandEmpty();
-    int responseTargetRank() const;
+    // Endgame special rule preserved from your previous code
+    bool m_lastPlayedWasSeven = false;
+    Turn m_lastPlayedBy = Turn::Player;
+
+    // For 40–40 tie-breaker
+    Winner m_lastPileWinner = Winner::Player;
 };

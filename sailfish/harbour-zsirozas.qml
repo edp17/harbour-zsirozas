@@ -190,9 +190,9 @@ ApplicationWindow
                     Button {
                         anchors.horizontalCenter: parent.horizontalCenter
                         text: qsTr("Let it go")
-                        visible: engine.playerCanPass
-                        enabled: engine.playerCanPass && engine.playerInputEnabled
-                        onClicked: engine.playerPass()
+                        visible: engine.allowLeave && engine.canLeave
+                        enabled: engine.allowLeave && engine.canLeave
+                        onClicked: engine.playerLeave()
                     }
 
                     // Player won pile preview (count only)
