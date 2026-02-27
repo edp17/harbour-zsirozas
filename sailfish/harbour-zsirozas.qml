@@ -190,8 +190,8 @@ ApplicationWindow
                     Button {
                         anchors.horizontalCenter: parent.horizontalCenter
                         text: qsTr("Let it go")
-                        visible: engine.allowLeave && engine.canLeave
-                        enabled: engine.allowLeave && engine.canLeave
+                        visible: engine.canLeave
+                        enabled: engine.canLeave
                         onClicked: engine.playerLeave()
                     }
 
@@ -231,7 +231,12 @@ ApplicationWindow
                                 width: Theme.itemSizeLarge
                                 height: Theme.itemSizeLarge * 1.4
 
-                                enabled: engine.playerInputEnabled
+                                enabled: engine.playerInputEnabled  &&
+                                         (
+                                           // If "Let go" is offered, player must either HIT or press "Let go"
+                                           (!engine.canLeave) ||
+                                           (modelData.rank === engine.cardToHit || modelData.rank === 7)
+                                         )
 
                                 onClicked: engine.playCard(index)
 

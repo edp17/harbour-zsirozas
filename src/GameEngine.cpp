@@ -7,8 +7,6 @@
 
 static std::mt19937 rng{ std::random_device{}() };
 
-bool allowLeave() const { return false; }
-
 QVariantList GameEngine::toVariantList(const QVector<Card>& v)
 {
     QVariantList out;
@@ -41,12 +39,17 @@ GameEngine::GameEngine(QObject* parent) : QObject(parent)
         if (!m_roundResult.isEmpty()) return;
         if (m_pilePending) return;
         if (m_cpu.isEmpty()) {
-            // If there is an active pile, resolve it to last hitter.
+            // If there's an active pile, resolve it to last hitter.
             if (!m_table.isEmpty() && !m_pilePending) {
                 scheduleRoundWin(m_lastHitter);
             } else {
-                // No pile; if deck empty too, we may be done
-                if (isGameOverCondition()) finishGame();
+                // No pile: if player still has cards, give them the turn; else finish.
+                if (!m_player.isEmpty()) {
+                    m_turn = Turn::Player;
+                    emit stateChanged();
+                } else if (isGameOverCondition()) {
+                    finishGame();
+                }
             }
             return;
         }
@@ -80,11 +83,16 @@ bool GameEngine::playerInputEnabled() const
 
 bool GameEngine::canLeave() const
 {
-    // leave is only enabled in the "starter decision" phase.
-    // In our 2-player model, that means: not forced-hit phase and it's player's turn and pile exists.
-    return playerInputEnabled()
-        && (m_movesInPile >= 2)
-        && !m_haveToMove;
+    if (!playerInputEnabled()) return false;
+    if (m_movesInPile < 2) return false;
+    if (m_haveToMove) return false;                 // decision phase
+    if (m_roundStarter != Turn::Player) return false; // starter must be human
+
+    // Decision only matters if someone else currently controls the pile
+    if (m_lastHitter == Winner::Player) return false;
+
+    // If player can't hit, engine should auto-resolve anyway
+    return handHasHitCard(m_player);
 }
 
 void GameEngine::initDeck()
@@ -106,24 +114,63 @@ void GameEngine::initDeck()
     m_talon = deck;
 }
 
+
 void GameEngine::refillHands(Winner firstDraws)
 {
-    auto drawOne = [&](QVector<Card>& hand) {
-        if (!m_talon.isEmpty())
+    const int talonBefore = m_talon.size();
+    const int pBefore = m_player.size();
+    const int cBefore = m_cpu.size();
+
+    int drewPlayer = 0;
+    int drewCpu = 0;
+
+    auto drawOne = [&](QVector<Card>& hand, bool isPlayer) {
+        if (!m_talon.isEmpty()) {
             hand.append(m_talon.takeLast());
+            if (isPlayer) ++drewPlayer; else ++drewCpu;
+        }
     };
 
-    auto fillToFour = [&](QVector<Card>& hand) {
-        while (hand.size() < 4 && !m_talon.isEmpty())
-            drawOne(hand);
+    auto needCard = [&](const QVector<Card>& hand) -> bool {
+        return hand.size() < 4;
     };
 
-    if (firstDraws == Winner::Player) {
-        fillToFour(m_player);
-        fillToFour(m_cpu);
-    } else {
-        fillToFour(m_cpu);
-        fillToFour(m_player);
+    const bool firstIsPlayer = (firstDraws == Winner::Player);
+    QVector<Card>* first  = firstIsPlayer ? &m_player : &m_cpu;
+    QVector<Card>* second = firstIsPlayer ? &m_cpu    : &m_player;
+
+    // Alternate draws: first, second, first, second... until both are full or talon empty.
+    while (!m_talon.isEmpty() && (needCard(*first) || needCard(*second))) {
+        if (needCard(*first) && !m_talon.isEmpty())
+            drawOne(*first, firstIsPlayer);
+        if (needCard(*second) && !m_talon.isEmpty())
+            drawOne(*second, !firstIsPlayer);
+    }
+
+    // --- Invariant checks (debug/warning) ---
+    const int talonAfter = m_talon.size();
+
+    // Talon should remain even in 2-player Zsírozás (32-card deck).
+    if ((talonAfter % 2) != 0) {
+        qWarning() << "[BUG] Talon became odd after refill:"
+                   << "before=" << talonBefore << "after=" << talonAfter;
+    }
+
+    // Both players should draw the same number of cards after each pile capture.
+    if (drewPlayer != drewCpu) {
+        qWarning() << "[BUG] Unequal draws in refillHands:"
+                   << "drewPlayer=" << drewPlayer << "drewCpu=" << drewCpu
+                   << "firstDraws=" << (firstDraws == Winner::Player ? "Player" : "CPU")
+                   << "talonBefore=" << talonBefore << "talonAfter=" << talonAfter
+                   << "handBefore(P,C)=" << pBefore << cBefore
+                   << "handAfter(P,C)=" << m_player.size() << m_cpu.size();
+    }
+
+    // Hand sizes should match after refill (normally equal in 2-player play).
+    if (m_player.size() != m_cpu.size()) {
+        qWarning() << "[BUG] Hand sizes diverged after refill:"
+                   << "player=" << m_player.size() << "cpu=" << m_cpu.size()
+                   << "talonAfter=" << talonAfter;
     }
 }
 
@@ -190,6 +237,14 @@ void GameEngine::newGame()
 
 void GameEngine::playCard(int handIndex)
 {
+
+    // If "Let go" is offered, only HIT cards are legal plays (otherwise use Let go).
+    if (canLeave()) {
+        if (handIndex < 0 || handIndex >= m_player.size()) return;
+        const Card& c = m_player[handIndex];
+        if (!isHitRank(c.rank)) return;
+    }
+
     if (!m_roundResult.isEmpty()) return;
     if (!playerInputEnabled()) return;
 
@@ -198,7 +253,6 @@ void GameEngine::playCard(int handIndex)
 
     applyMove(Turn::Player, handIndex);
 
-    // Unlock unless pile is pending capture
     if (!m_pilePending) {
         m_inputLocked = false;
         emit stateChanged();
@@ -256,6 +310,14 @@ void GameEngine::advanceAfterPlay(Turn whoJustPlayed, int playedRank)
         updateStatusText();
         emit statusChanged();
         emit stateChanged();
+
+        // After the first card, the next player is in forced-hit phase.
+        // If they have no legal hit, auto-win goes to last hitter (the starter).
+        const QVector<Card>& responderHand = (m_turn == Turn::Player) ? m_player : m_cpu;
+        if (responderHand.isEmpty()) {
+            scheduleRoundWin(m_lastHitter);
+            return;
+        }
 
         maybeScheduleCpuMove();
         return;
@@ -324,6 +386,11 @@ void GameEngine::scheduleRoundWin(Winner winner)
     m_pilePending = true;
     m_inputLocked = true;
 
+    if (m_table.size() == 1) {
+        qWarning() << "[BUG-scheduleRoundWin()] Attempted to resolve a 1-card pile; refusing.";
+        return;
+    }
+
     resolvePileAfterDelay();
     emit stateChanged();
 }
@@ -354,6 +421,11 @@ void GameEngine::commitPile()
 
     const Winner winner = m_pendingWinner;
     m_pilePending = false;
+
+    if (m_table.size() == 1) {
+        qWarning() << "[BUG-commitPile()] Attempted to resolve a 1-card pile; refusing.";
+        return;
+    }
 
     capturePile(winner);
 
@@ -429,10 +501,17 @@ void GameEngine::maybeScheduleCpuMove()
     if (!m_roundResult.isEmpty()) return;
     if (m_pilePending) return;
     if (m_cpu.isEmpty()) {
+        // If there's an active pile, resolve it to last hitter.
         if (!m_table.isEmpty() && !m_pilePending) {
             scheduleRoundWin(m_lastHitter);
         } else {
-            if (isGameOverCondition()) finishGame();
+            // No pile: if player still has cards, give them the turn; else finish.
+            if (!m_player.isEmpty()) {
+                m_turn = Turn::Player;
+                emit stateChanged();
+            } else if (isGameOverCondition()) {
+                finishGame();
+            }
         }
         return;
     }
