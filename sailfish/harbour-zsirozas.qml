@@ -46,15 +46,33 @@ ApplicationWindow
             property bool aiCardLanded: false
             property bool aiFlyingActive: false
             property string hideAiStaticId: ""
+
+            property string pendingAiCardId: ""
             property bool dealingPaused: false
+            property bool capturePending: false
             property int pileFlightsInProgress: 0
+            property bool captureGateTimerFired: true
+            property double captureGateStartedAt: 0
             property bool pendingTrickResolve: false
-            property int tableFlightDuration:
-                Math.round(500 / appSettings.tableFlightDuration)
-            property int pileFlightDuration: 500   // ms (same animation, different target)
+            property int tableFlightDuration: effDur(appSettings.tableFlightDuration, 250)
+            property int pileFlightDuration: tableFlightDuration + 250   // ms
             property string ai1Name: appSettings.ai1Name
 
-            function resetSeen() {
+                        function effDur(v, baseMs) {
+                // Backward compatible: older settings may store a small "speed factor" (1..10).
+                // If v is small, treat it as a multiplier; otherwise treat it as milliseconds.
+                if (v === undefined || v === null) return baseMs;
+                if (v <= 0) return baseMs;
+                if (v < 50) return v * baseMs;
+                return v;
+            }
+
+            function dur(baseMs) {
+                // Apply the same animation speed scaling as tableFlightDuration.
+                return effDur(appSettings.tableFlightDuration, baseMs);
+            }
+
+function resetSeen() {
                 seenPlayerIds = ({})
                 seenAiIds = ({})
                 freshRound = true
@@ -97,11 +115,30 @@ ApplicationWindow
             // Prevent "vibration": delay hand deal animations right after pile capture flights
             Timer {
                 id: dealResumeTimer
-                interval: 750
+                interval: 250
                 repeat: false
-                onTriggered: mainPage.dealingPaused = false
+                onTriggered: {
+                    mainPage.captureGateTimerFired = true
+                    console.info("[DEAL_GATE] dealResumeTimer fired interval=", interval,
+                                 "pileFlightsInProgress=", mainPage.pileFlightsInProgress,
+                                 "dealingPaused=", mainPage.dealingPaused)
+                    mainPage.tryResumeDealing("timer")
+                }
             }
 
+
+
+            Timer {
+                id: aiSpawnTimer
+                interval: 0
+                repeat: false
+                onTriggered: {
+                    if (mainPage.pendingAiCardId !== "") {
+                        spawnAIFlyingCard(mainPage.pendingAiCardId)
+                        mainPage.pendingAiCardId = ""
+                    }
+                }
+            }
 
             // Helper functions ---------------------------
             function updateAllDealOrigins() {
@@ -175,15 +212,55 @@ ApplicationWindow
                 c.flyToTable()
             }
 
-            function animateTableCardsToWinner() {
+            
+function scheduleDealResumeAfterCapture(nCards) {
+    // Ensure dealing resumes only AFTER capture flights are expected to finish.
+    // nCards: number of cards flying from table to winner pile.
+    if (nCards === undefined || nCards === null) nCards = 0;
+
+    // Capture flight uses pileFlightDuration with per-card stagger of 80ms.
+    var stagger = 80;
+    var buffer = dur(320); // small settle time after landing/rotation
+    var total = pileFlightDuration + Math.max(0, (nCards - 1)) * stagger + buffer;
+
+    if (total < dur(250)) total = dur(250);
+
+    dealResumeTimer.interval = total;
+    dealResumeTimer.restart();
+}
+
+
+function tryResumeDealing(reason) {
+    // Resume dealing only when BOTH: capture flights are done AND our time gate has elapsed.
+    if (mainPage.pileFlightsInProgress === 0 && mainPage.captureGateTimerFired) {
+        if (mainPage.dealingPaused || mainPage.capturePending) {
+            console.info('[DEAL_GATE] RESUME dealing (reason=' + reason + ') elapsedMs=', (Date.now() - mainPage.captureGateStartedAt))
+        }
+        mainPage.dealingPaused = false
+        mainPage.capturePending = false
+    } else {
+        console.info('[DEAL_GATE] keep paused (reason=' + reason + ') timerFired=', mainPage.captureGateTimerFired,
+                     ' flights=', mainPage.pileFlightsInProgress)
+    }
+}
+
+function animateTableCardsToWinner() {
                 if (engine.tableCards.length < 2)
                     return
 
                 var playerWon = playerWonCurrentTrick()
                 var target = playerWon ? playerWonDealPoint : aiWonDealPoint
 
+
+                mainPage.dealingPaused = true
+                mainPage.capturePending = true
                 mainPage.pileFlightsInProgress = engine.tableCards.length
 
+                console.info("[DEAL_GATE] CAPTURE start (live) nCards=", engine.tableCards.length,
+                             "tableFlightDuration=", tableFlightDuration,
+                             "pileFlightDuration=", pileFlightDuration)
+
+                scheduleDealResumeAfterCapture(engine.tableCards.length);
                 for (var i = 0; i < engine.tableCards.length; ++i) {
                     var card = engine.tableCards[i]
 
@@ -198,6 +275,7 @@ ApplicationWindow
                         shouldFlipMidFlight: true,     // always flip mid-flight
                         flightRole: "toPile",
                         flightDuration: pileFlightDuration,
+                        startDelay: i * dur(120),
                         startScale: 1.0,
                         endScale: 0.5,
                         x: start.x,
@@ -212,9 +290,14 @@ ApplicationWindow
                 if (!cards || cards.length < 2)
                     return
                 mainPage.dealingPaused = true
-                dealResumeTimer.restart()
+                mainPage.capturePending = true
+                mainPage.pileFlightsInProgress = cards.length
 
-                // Winner = last hitter in this pile (same logic as playerWonCurrentTrick but using snapshot)
+                console.info("[DEAL_GATE] CAPTURE start (snapshot) nCards=", cards.length,
+                             "tableFlightDuration=", tableFlightDuration,
+                             "pileFlightDuration=", pileFlightDuration)
+
+                scheduleDealResumeAfterCapture(cards.length); // Winner = last hitter in this pile (same logic as playerWonCurrentTrick but using snapshot)
                 var cardToHit = cards[0].rank
                 var lastHitterPlayedBy = cards[0].playedBy
                 for (var i = 1; i < cards.length; ++i) {
@@ -238,6 +321,7 @@ ApplicationWindow
                         shouldFlipMidFlight: true,
                         flightRole: "toPile",
                         flightDuration: pileFlightDuration,
+                        startDelay: j * dur(120),
                         startScale: 1.0,
                         endScale: 0.5,
                         x: start.x,
@@ -262,6 +346,7 @@ ApplicationWindow
                     scale: startScale
                     property bool shouldFlipMidFlight: false
                     property int flightDuration: 500   // must match x/y animation duration
+                    property int startDelay: 0
                     property bool flipToFaceUpOnTable: false
                     property string flightRole: ""   // "playerToTable" | "aiToTable" | "toPile"
 
@@ -282,16 +367,41 @@ ApplicationWindow
                         angle: 0
                     }
 
-                    function flyToTable() {
-                        if (flipToFaceUpOnTable) {
-                            midFlipTimer.start()
+                    Timer {
+                        id: startDelayTimer
+                        interval: flyingCard.startDelay
+                        repeat: false
+                        onTriggered: {
+                            flyAnim.start()
+                            // Start flip after flight starts if requested
+                            if (flyingCard.flipToFaceUpOnTable) {
+                                midFlipTimer.start()
+                            } else if (flyingCard.wonByPlayer && flyingCard.shouldFlipMidFlight) {
+                                midFlipTimer.start()
+                            }
                         }
+                    }
 
-                        var target = tableDealPoint.mapToItem(animationLayer, 0, 0)
+                    function startFlight() {
+                        if (flyingCard.startDelay > 0) {
+                            startDelayTimer.restart()
+                        } else {
+                            flyAnim.start()
+                            if (flyingCard.flipToFaceUpOnTable) {
+                                midFlipTimer.start()
+                            } else if (flyingCard.wonByPlayer && flyingCard.shouldFlipMidFlight) {
+                                midFlipTimer.start()
+                            }
+                        }
+                    }
+
+                    function flyToTable() {
+                        // flip handled in startFlight()
+var target = tableDealPoint.mapToItem(animationLayer, 0, 0)
 
                         xAnim.to = target.x
                         yAnim.to = target.y
-                        flyAnim.start()
+                        startFlight()
 
                     }
 
@@ -299,12 +409,8 @@ ApplicationWindow
                         var target = targetItem.mapToItem(animationLayer, 0, 0)
                         xAnim.to = target.x
                         yAnim.to = target.y
-                        flyAnim.start()
-                        // ONLY player-won cards flip mid-air
-                        if (wonByPlayer && shouldFlipMidFlight) {
-                            midFlipTimer.start()
-                        }
-                    }
+                        startFlight()
+}
 
                     Timer {
                         id: midFlipTimer
@@ -339,7 +445,7 @@ ApplicationWindow
                             target: flyingCard
                             property: "scale"
                             to: flyingCard.endScale
-                            duration: 500   // match your flight duration
+                            duration: flyingCard.flightDuration
                             easing.type: Easing.OutCubic
                         }
 
@@ -358,6 +464,10 @@ ApplicationWindow
                                 mainPage.aiCardLanded &&
                                 mainPage.pendingTrickResolve) {
 
+                                // Gate dealing as soon as the trick is complete (both cards landed).
+                                // The engine may already update hands before the capture animation starts.
+                                mainPage.dealingPaused = true
+                                mainPage.capturePending = true
                                 mainPage.phase = "pause"
                                 mainPage.pendingTrickResolve = false
                                 resolveTrickTimer.restart()   // this is your trickResolveDelay pause
@@ -366,10 +476,12 @@ ApplicationWindow
                             // 2) Flying to winner pile
                             if (flyingCard.flightRole === "toPile") {
                                 mainPage.pileFlightsInProgress--
+                                console.info("[DEAL_GATE] pile flight finished cardId=", flyingCard.cardId,
+                                             "remaining=", mainPage.pileFlightsInProgress)
                                 if (mainPage.pileFlightsInProgress === 0) {
-                                    // engine.resolveCurrentTrick()  // removed: engine resolves internally
                                     mainPage.phase = "idle"
                                 }
+                                mainPage.tryResumeDealing("flight")
                             }
 
                             flyingCard.destroy()
@@ -654,7 +766,7 @@ ApplicationWindow
                                 property real handWidth: (count - 1) * spacing + width
 
                                 property bool bornAtDeck: (!mainPage.dealingPaused && !mainPage.seenAiIds[modelData.id])
-                                property int dealDelay: index * 220
+                                property int dealDelay: index * dur(220)
                                 property real finalX: (aiHandArea.width - handWidth) / 2 + index * spacing
                                 property real finalY: 0
 
@@ -667,20 +779,90 @@ ApplicationWindow
                                 opacity: 0.9
 
                                 Behavior on x {
-                                    NumberAnimation { duration: 200; easing.type: Easing.OutCubic }
+                                    NumberAnimation { duration: dur(200); easing.type: Easing.OutCubic }
                                 }
 
                                 Behavior on y {
-                                    NumberAnimation { duration: 240; easing.type: Easing.OutCubic }
+                                    NumberAnimation { duration: dur(240); easing.type: Easing.OutCubic }
+                                }
+
+                                function startDealIfNeeded() {
+                                    if (mainPage.seenAiIds[modelData.id]) {
+                                        aiCard.opacity = 1.0
+                                        return
+                                    }
+
+                                    if (bornAtDeck) {
+                                        if (mainPage.dealingPaused || mainPage.capturePending || mainPage.pileFlightsInProgress > 0) {
+                                            aiCard.opacity = 0
+                                            waitDealTimer.start()
+                                            return
+                                        }
+                                        mainPage.seenAiIds[modelData.id] = true
+                                        aiCard.opacity = 0
+                                        deferDealStartTimer.restart()
+                                    } else {
+                                        mainPage.seenAiIds[modelData.id] = true
+                                        aiCard.opacity = 1.0
+                                    }
                                 }
 
                                 Component.onCompleted: {
-                                    mainPage.seenAiIds[modelData.id] = true
+                                     // Decide once per delegate if this card should animate from deck.
+                                     bornAtDeck = mainPage.freshRound || (!mainPage.seenAiIds[modelData.id])
+                                     console.info("[DEAL_GATE] AI card delegate created id=", modelData.id,
+                                                  "dealingPaused=", mainPage.dealingPaused,
+                                                  "capturePending=", mainPage.capturePending,
+                                                  "bornAtDeck=", bornAtDeck)
 
-                                    if (bornAtDeck) {
-                                        dealTimer.start()
+
+                                     if (mainPage.dealingPaused || mainPage.capturePending) {
+                                        // During capture/deal-pause: only gate newly dealt cards.
+                                        if (bornAtDeck) {
+                                            opacity = 0.0;
+                                            waitDealTimer.start();
+                                        } else {
+                                            opacity = 1.0;
+                                        }
                                     } else {
-                                        bornAtDeck = false
+                                        startDealIfNeeded();
+                                    }
+                                }
+
+                                Timer {
+                                    id: waitDealTimer
+                                    interval: 50
+                                    repeat: true
+                                    running: false
+                                    onTriggered: {
+                                        if (!mainPage.dealingPaused && !mainPage.capturePending && mainPage.pileFlightsInProgress === 0) {
+                                             console.info("[DEAL_GATE] AI waitDealTimer release id=", modelData.id,
+                                                          "bornAtDeck=", bornAtDeck)
+                                             stop();
+                                             if (bornAtDeck) {
+                                                 mainPage.seenAiIds[modelData.id] = true
+                                                 opacity = 1.0
+                                                 dealTimer.restart()
+                                             } else {
+                                                 opacity = 1.0
+                                             }
+                                        }
+                                    }
+                                }
+
+                                Timer {
+                                    id: deferDealStartTimer
+                                    interval: 0
+                                    repeat: false
+                                    running: false
+                                    onTriggered: {
+                                        if (mainPage.dealingPaused || mainPage.capturePending || mainPage.pileFlightsInProgress > 0) {
+                                            aiCard.opacity = 0
+                                            waitDealTimer.start()
+                                            return
+                                        }
+                                        aiCard.opacity = 0.9
+                                        dealTimer.start()
                                     }
                                 }
 
@@ -704,7 +886,7 @@ ApplicationWindow
                                         target: aiCard
                                         property: "dealOffsetX"
                                         to: 0
-                                        duration: 260
+                                        duration: dur(260)
                                         easing.type: Easing.OutCubic
                                     }
 
@@ -712,7 +894,7 @@ ApplicationWindow
                                         target: aiCard
                                         property: "dealOffsetY"
                                         to: 0
-                                        duration: 260
+                                        duration: dur(260)
                                         easing.type: Easing.OutCubic
                                     }
 
@@ -813,7 +995,10 @@ ApplicationWindow
                                 if (len > lastTableCount) {
                                     var last = engine.tableCards[len - 1]
                                     if (last.playedBy === 1) {
-                                        spawnAIFlyingCard(last.id)
+                                        mainPage.aiFlyingActive = true
+                                        mainPage.hideAiStaticId = last.id
+                                        mainPage.pendingAiCardId = last.id
+                                        aiSpawnTimer.restart()
                                     }
                                 } else if (len === 0 && lastTableCount > 0) {
                                     // Table cleared: animate capture from snapshot
@@ -834,17 +1019,17 @@ ApplicationWindow
                                 // Stacking + layout for up to 4 cards
                                 z: index
 
-                                // Slight fan/stack so later cards are visible
-                                x: (index % 2 === 0 ? -1 : 1) * Theme.paddingLarge * 0.6
-                                y: -height / 2 - index * Theme.paddingSmall * 0.55
-                                rotation: (index % 2 === 0 ? -1 : 1) * (4 + index * 1.5)
+                                // Fan/stack so all cards remain visible
+                                x: 0
+                                y: -height / 2 + index * Theme.paddingMedium * 1.10
+                                rotation: -12 + index * 6
 
                                 // Hide the newest AI table card while its flying clone is animating
                                 opacity: (modelData.playedBy === 1 && mainPage.aiFlyingActive && modelData.id === mainPage.hideAiStaticId) ? 0.0 : 1.0
 
-                                Behavior on x { NumberAnimation { duration: 160; easing.type: Easing.OutCubic } }
-                                Behavior on y { NumberAnimation { duration: 160; easing.type: Easing.OutCubic } }
-                                Behavior on rotation { NumberAnimation { duration: 160; easing.type: Easing.OutCubic } }
+                                Behavior on x { NumberAnimation { duration: 220; easing.type: Easing.OutCubic } }
+                                Behavior on y { NumberAnimation { duration: 220; easing.type: Easing.OutCubic } }
+                                Behavior on rotation { NumberAnimation { duration: 220; easing.type: Easing.OutCubic } }
                                 Behavior on opacity { NumberAnimation { duration: 120 } }
                             }
                         }
@@ -974,7 +1159,7 @@ ApplicationWindow
                         }
 
                         Behavior on scale {
-                            NumberAnimation { duration: 200; easing.type: Easing.OutCubic }
+                            NumberAnimation { duration: dur(200); easing.type: Easing.OutCubic }
                         }
 
                         opacity: engine.roundResult.length > 0
@@ -1015,15 +1200,16 @@ ApplicationWindow
                                 id: mouseArea
 
                                 enabled: engine.playerInputEnabled &&
-                                         (!engine.canLeave || modelData.rank === engine.cardToHit || modelData.rank === 7)
+                                         (!engine.canLeave || modelData.rank === engine.cardToHit || modelData.rank === 7) &&
+                                         !bornAtDeck && opacity > 0.2
 
                                 property int count: engine.playerHand.length
                                 property real centerIndex: (count - 1) / 2
                                 property real distanceFromCenter: Math.abs(index - centerIndex)
                                 property real spacing: card.width * 0.6
                                 property real handWidth: (count - 1) * spacing + card.width
-                                property bool bornAtDeck: (mainPage.freshRound || (!mainPage.dealingPaused && !mainPage.seenPlayerIds[modelData.id]))
-                                property int dealDelay: index * 220
+                                property bool bornAtDeck: false
+                                property int dealDelay: index * dur(220)
                                 property real dealOffsetX: 0
                                 property real dealOffsetY: 0
                                 property bool isBeingPlayed: false
@@ -1050,6 +1236,7 @@ ApplicationWindow
                                 y: bornAtDeck ? (handArea.dealOrigin.y - height/2) : finalY
 
                                 onClicked: {
+                                    if (bornAtDeck || opacity <= 0.2) return
                                     if (isBeingPlayed) return            // prevent double-tap spam
                                     isBeingPlayed = true                 // hide immediately
                                     var p = mouseArea.mapToItem(animationLayer,
@@ -1064,29 +1251,105 @@ ApplicationWindow
                                 onCanceled: card.pressed = false
 
                                 Behavior on x {
-                                    NumberAnimation { duration: 200; easing.type: Easing.OutCubic }
+                                    NumberAnimation { duration: dur(200); easing.type: Easing.OutCubic }
                                 }
 
                                 Behavior on y {
-                                    NumberAnimation { duration: 120; easing.type: Easing.OutCubic }
+                                    NumberAnimation { duration: dur(240); easing.type: Easing.OutCubic }
+                                }
+
+                                function startDealIfNeeded() {
+                                    // If we already handled this card, just make sure it is visible.
+                                    if (mainPage.seenPlayerIds[modelData.id]) {
+                                        mouseArea.opacity = 1.0
+                                        return
+                                    }
+
+                                    if (bornAtDeck) {
+                                        // Newly dealt card: if we are currently gating dealing, keep it hidden and wait.
+                                        if (mainPage.dealingPaused || mainPage.capturePending || mainPage.pileFlightsInProgress > 0) {
+                                            mouseArea.opacity = 0
+                                            waitDealTimer.start()
+                                            return
+                                        }
+
+                                        // We are allowed to deal now.
+                                        mainPage.seenPlayerIds[modelData.id] = true
+                                        mouseArea.opacity = 0
+                                        // x/y are bound to bornAtDeck; keep bornAtDeck=true until dealAnim stops.
+                                        deferDealStartTimer.restart()
+                                    } else {
+                                        // Existing hand card (not from deck)
+                                        mainPage.seenPlayerIds[modelData.id] = true
+                                        mouseArea.opacity = 1.0
+                                    }
                                 }
 
                                 Component.onCompleted: {
-                                    // Mark as seen immediately (persists across model rebuilds)
-                                    mainPage.seenPlayerIds[modelData.id] = true
+                                     // Decide once per delegate if this card should animate from deck.
+                                     // Important: do NOT bind bornAtDeck to seen/dealingPaused, otherwise it flips mid-flow.
+                                     bornAtDeck = mainPage.freshRound || (!mainPage.seenPlayerIds[modelData.id])
+                                     console.info("[DEAL_GATE] PLAYER card delegate created id=", modelData.id,
+                                                  "dealingPaused=", mainPage.dealingPaused,
+                                                  "capturePending=", mainPage.capturePending,
+                                                  "bornAtDeck=", bornAtDeck)
 
-                                    if (bornAtDeck) {
-                                        dealOffsetX = handArea.dealOrigin.x - x - width / 2
-                                        dealOffsetY = handArea.dealOrigin.y - height / 2
-                                        dealTimer.start()
-                                    } else {
-                                        // Skip animation: snap to final position
-                                        bornAtDeck = false
-                                    }
 
-                                    // After first hand is created, we are no longer in fresh round
+                                     // After first hand is created, we are no longer in fresh round
                                     // (this runs multiple times; safe)
                                     mainPage.freshRound = false
+
+                                    if (mainPage.dealingPaused || mainPage.capturePending) {
+                                        // During capture/deal-pause: only gate *newly dealt* cards.
+                                        // Already-in-hand cards must remain visible (delegates can be recreated while paused).
+                                        if (bornAtDeck) {
+                                            mouseArea.opacity = 0
+                                            waitDealTimer.start()
+                                        } else {
+                                            mouseArea.opacity = 1.0
+                                        }
+                                    } else {
+                                        startDealIfNeeded()
+                                    }
+                                }
+
+                                Timer {
+                                    id: waitDealTimer
+                                    interval: 50
+                                    repeat: true
+                                    running: false
+                                    onTriggered: {
+                                        if (!mainPage.dealingPaused && !mainPage.capturePending && mainPage.pileFlightsInProgress === 0) {
+                                             console.info("[DEAL_GATE] PLAYER waitDealTimer release id=", modelData.id,
+                                                          "bornAtDeck=", bornAtDeck)
+                                             stop()
+                                             if (bornAtDeck) {
+                                                 // Start the actual deal animation now (even if seen was set earlier).
+                                                 mainPage.seenPlayerIds[modelData.id] = true
+                                                 mouseArea.opacity = 1.0
+                                                 dealTimer.restart()
+                                             } else {
+                                                 // Delegate recreated while paused; restore visibility.
+                                                 mouseArea.opacity = 1.0
+                                             }
+                                        }
+                                    }
+                                }
+
+                                Timer {
+                                    id: deferDealStartTimer
+                                    interval: 0
+                                    repeat: false
+                                    running: false
+                                    onTriggered: {
+                                        if (mainPage.dealingPaused || mainPage.capturePending || mainPage.pileFlightsInProgress > 0) {
+                                            mouseArea.opacity = 0
+                                            waitDealTimer.start()
+                                            return
+                                        }
+                                        mouseArea.opacity = 1.0
+                                        dealTimer.start()
+                                    }
                                 }
 
                                 Timer {
@@ -1104,14 +1367,14 @@ ApplicationWindow
 
                                 Timer {
                                     id: dealFlipTimer
-                                    interval: 250               // 500ms deal / 2
+                                    interval: dur(250)               // scaled
                                     repeat: false
                                     onTriggered: dealFlipAnim.start()
                                 }
 
                                 Timer {
                                     id: playTimer
-                                    interval: 500
+                                    interval: dur(500)
                                     repeat: false
                                     onTriggered: engine.playCard(index)
                                 }
@@ -1123,7 +1386,7 @@ ApplicationWindow
                                         target: mouseArea
                                         property: "x"
                                         to: mouseArea.finalX
-                                        duration: 280
+                                        duration: dur(280)
                                         easing.type: Easing.OutCubic
                                     }
 
@@ -1131,7 +1394,7 @@ ApplicationWindow
                                         target: mouseArea
                                         property: "y"
                                         to: mouseArea.finalY
-                                        duration: 280
+                                        duration: dur(280)
                                         easing.type: Easing.OutCubic
                                     }
 
@@ -1156,7 +1419,7 @@ ApplicationWindow
 
                                     Behavior on scale {
                                         NumberAnimation {
-                                            duration: 260
+                                            duration: dur(260)
                                             easing.type: Easing.OutCubic
                                         }
                                     }
@@ -1393,7 +1656,7 @@ ApplicationWindow
                     scale: text.length > 0 ? 1.1 : 1.0
 
                     Behavior on scale {
-                        NumberAnimation { duration: 200; easing.type: Easing.OutCubic }
+                        NumberAnimation { duration: dur(200); easing.type: Easing.OutCubic }
                     }
                 }
                 
