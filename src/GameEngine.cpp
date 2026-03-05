@@ -5,6 +5,13 @@
 #include <QVariantMap>
 #include <QDebug>
 
+// #define ZSIROZAS_TRACE 1
+#if defined(ZSIROZAS_TRACE)
+  #define TRACE(...) qDebug() << __VA_ARGS__
+#else
+  #define TRACE(...) do {} while (0)
+#endif
+
 static std::mt19937 rng{ std::random_device{}() };
 
 QVariantList GameEngine::toVariantList(const QVector<Card>& v)
@@ -286,8 +293,8 @@ void GameEngine::applyMove(Turn who, int handIndex)
     m_lastPlayedWasSeven = (played.rank == 7);
     m_lastPlayedBy = who;
 
-    qDebug() << "[applyMove]" << (who == Turn::Player ? "Player" : "CPU")
-             << "played" << played.rank << "tableSizeNow=" << m_table.size();
+////    qDebug() << "[applyMove]" << (who == Turn::Player ? "Player" : "CPU")
+////             << "played" << played.rank << "tableSizeNow=" << m_table.size();
 
     advanceAfterPlay(who, played.rank);
 }
@@ -397,9 +404,9 @@ void GameEngine::scheduleRoundWin(Winner winner)
 
 void GameEngine::resolvePileAfterDelay()
 {
-    qDebug() << "[resolvePileAfterDelay] pending=" << m_pilePending
-             << "winner=" << (m_pendingWinner == Winner::Player ? "Player" : "CPU")
-             << "delay=" << m_pileDelayMs;
+////    qDebug() << "[resolvePileAfterDelay] pending=" << m_pilePending
+////             << "winner=" << (m_pendingWinner == Winner::Player ? "Player" : "CPU")
+////             << "delay=" << m_pileDelayMs;
 
     m_pileTimer.stop();
     m_pileTimer.start(m_pileDelayMs);
@@ -407,7 +414,7 @@ void GameEngine::resolvePileAfterDelay()
 
 void GameEngine::commitPile()
 {
-    qDebug() << "[pileTimer timeout] pending=" << m_pilePending << "tableSize=" << m_table.size();
+////    qDebug() << "[pileTimer timeout] pending=" << m_pilePending << "tableSize=" << m_table.size();
 
     if (!m_pilePending)
         return;

@@ -1,6 +1,6 @@
 Name: harbour-zsirozas
 Version: 0.1.1
-Release: 20
+Release: 30
 Summary: Hungarian Fat Card Game (Zsir, Zsirozas)
 License: MIT
 URL: https://example.com/harbour-zsirozas

@@ -27,7 +27,7 @@ class GameEngine : public QObject
 
     Q_PROPERTY(int aiPlayDelay READ aiPlayDelay WRITE setAiPlayDelay NOTIFY aiPlayDelayChanged)
 
-    // New rule-state properties
+    // New rule-state properties (0v-style)
     Q_PROPERTY(int cardToHit READ cardToHit NOTIFY stateChanged)
     Q_PROPERTY(bool haveToMove READ haveToMove NOTIFY stateChanged)
     Q_PROPERTY(bool canLeave READ canLeave NOTIFY stateChanged)
@@ -60,7 +60,7 @@ public:
     Q_INVOKABLE void newGame();
     Q_INVOKABLE void playCard(int handIndex);
 
-    // “Let it go” in UI
+    // “Let it go” in UI – in 0v this is “leave / don’t want to move” and awards pile to last hitter.
     Q_INVOKABLE void playerLeave();
     // Backward name kept so you don’t have to change QML call sites if you don’t want to.
     Q_INVOKABLE void playerPass() { playerLeave(); }
@@ -146,7 +146,7 @@ private:
     // Turn
     Turn m_turn = Turn::Player;
 
-    // pile state
+    // 0v-style pile state
     int  m_cardToHit = -1;              // rank of first card of pile
     bool m_haveToMove = true;           // forced-hit phase (true) vs starter decision phase (false)
     int  m_movesInPile = 0;             // number of played cards in current pile

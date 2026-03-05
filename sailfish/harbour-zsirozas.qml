@@ -32,6 +32,9 @@ ApplicationWindow
     {
         Page {
             id: mainPage
+    // Phase0: disable all visual animations; keep layout + game logic
+    property bool animationsEnabled: false
+    property var flyingById: ({})    // cardId -> flying clone object
 
             // Declarations ---------------------------
             property int lastTableCount: 0
@@ -50,11 +53,43 @@ ApplicationWindow
             property string pendingAiCardId: ""
             property bool dealingPaused: false
             property bool capturePending: false
+            property var pendingToPile: ({})  // cardId -> {playerWon, startDelay, startX, startY}
+property bool layoutFrozen: (dealingPaused || capturePending || pileFlightsInProgress > 0)
             property int pileFlightsInProgress: 0
-            property bool captureGateTimerFired: true
+property var landedFlyingCards: ({})
+property var flyingByCardId: ({})
+
+            function destroyFlyingForCard(cardId) {
+                // Robust cleanup: kill any existing flying clones (toTable/toPile) with this cardId.
+                // Also clears bookkeeping maps so later spawns don't "lose" the old instance.
+                try {
+                    for (var i = animationLayer.children.length - 1; i >= 0; --i) {
+                        var ch = animationLayer.children[i]
+                        if (ch && ch.cardId !== undefined && ch.cardId === cardId) {
+                            try { ch.destroy(); } catch(e) {}
+                        }
+                    }
+                } catch(e2) {}
+
+                if (mainPage.flyingByCardId && mainPage.flyingByCardId[cardId]) {
+                    try { mainPage.flyingByCardId[cardId].destroy(); } catch(e3) {}
+                    delete mainPage.flyingByCardId[cardId]
+                }
+                if (mainPage.landedFlyingCards && mainPage.landedFlyingCards[cardId]) {
+                    try { mainPage.landedFlyingCards[cardId].destroy(); } catch(e4) {}
+                    delete mainPage.landedFlyingCards[cardId]
+                }
+            }
+property var tableCardRefs: ({})
+property bool captureGateTimerFired: true
             property double captureGateStartedAt: 0
             property bool pendingTrickResolve: false
+            property int dealFirstSide: -1   // 0=player, 1=AI (who draws first after trick)
+property int dealPhaseEndsAtMs: 0
+            property int dealLoserExtraMs: 0  // extra delay applied to the non-winner's dealing
             property int tableFlightDuration: effDur(appSettings.tableFlightDuration, 250)
+            property bool dealPhaseActive: false   // blocks AI from playing next card until dealing visuals finish
+            property int dealPhaseMs: 0
             property int pileFlightDuration: tableFlightDuration + 250   // ms
             property string ai1Name: appSettings.ai1Name
 
@@ -68,6 +103,7 @@ ApplicationWindow
             }
 
             function dur(baseMs) {
+                if (!mainPage.animationsEnabled) return 0;
                 // Apply the same animation speed scaling as tableFlightDuration.
                 return effDur(appSettings.tableFlightDuration, baseMs);
             }
@@ -119,24 +155,41 @@ function resetSeen() {
                 repeat: false
                 onTriggered: {
                     mainPage.captureGateTimerFired = true
-                    console.info("[DEAL_GATE] dealResumeTimer fired interval=", interval,
-                                 "pileFlightsInProgress=", mainPage.pileFlightsInProgress,
-                                 "dealingPaused=", mainPage.dealingPaused)
                     mainPage.tryResumeDealing("timer")
                 }
             }
 
-
+            Timer {
+                id: dealPhaseTimer
+                interval: 100
+                repeat: true
+                running: true
+                onTriggered: {
+                    if (mainPage.dealPhaseActive && Date.now() >= mainPage.dealPhaseEndsAtMs) {
+                        mainPage.dealPhaseActive = false
+                        if (mainPage.aiSpawnDeferred && mainPage.pendingAiCardId >= 0) {
+                            mainPage.aiSpawnDeferred = false
+                            aiSpawnTimer.restart()
+                        }
+                    }
+                }
+            }
 
             Timer {
                 id: aiSpawnTimer
                 interval: 0
                 repeat: false
                 onTriggered: {
-                    if (mainPage.pendingAiCardId !== "") {
-                        spawnAIFlyingCard(mainPage.pendingAiCardId)
+                    if (!mainPage.animationsEnabled) {
+                        // No flying animation: keep the static delegate visible; just consume the pending flag.
+                        mainPage.aiFlyingActive = false
+                        mainPage.hideAiStaticId = ""
                         mainPage.pendingAiCardId = ""
+                        return
                     }
+                    if (!mainPage.pendingAiCardId) return
+                    spawnAIFlyingCard(mainPage.pendingAiCardId)
+                    mainPage.pendingAiCardId = ""
                 }
             }
 
@@ -166,50 +219,43 @@ function resetSeen() {
             }
 
 
-            function spawnFlyingCard(cardId, startPos) {
-                // New trick begins
-                phase = "toTable"
-                playerCardLanded = false
-                aiCardLanded = false
-
-                var c = flyingCardComponent.createObject(animationLayer, {
-                    cardId: cardId,
-                    faceUp: true,
-                    flightRole: "playerToTable",
-                    flightDuration: tableFlightDuration,
-                    startScale: 1.0,
-                    endScale: 1.0,
-                    x: startPos.x,
-                    y: startPos.y,
-                    z: 1000,
-                    opacity: 1.0
-                })
-
-                c.flyToTable()
+            function spawnFlyingCard(cardId, startPoint) {
+                if (!mainPage.animationsEnabled) return;
+                if (!cardId) return;
+                if (!startPoint) startPoint = Qt.point(0, 0);
+                // Destroy any previous clone for this cardId (defensive).
+                if (mainPage.flyingById && mainPage.flyingById[cardId]) {
+                    try { mainPage.flyingById[cardId].destroy(); } catch (e) {}
+                    mainPage.flyingById[cardId] = null
+                }
+                var obj = flyingCardComponent.createObject(animationLayer, {
+                                                            cardId: cardId,
+                                                            flightRole: "playerToTable",
+                                                            x: startPoint.x,
+                                                            y: startPoint.y,
+                                                            opacity: 1,
+                                                            visible: true
+                                                        })
+                if (!mainPage.flyingById) mainPage.flyingById = ({})
+                mainPage.flyingById[cardId] = obj
             }
 
             function spawnAIFlyingCard(cardId) {
+                if (!mainPage.animationsEnabled) return;
+                if (!cardId) return;
+                // Hide the static table delegate for this AI card while the flying clone is active.
                 mainPage.aiFlyingActive = true
                 mainPage.hideAiStaticId = cardId
-                var start = aiHandArea.mapToItem(animationLayer,
-                                                 aiHandArea.width / 2,
-                                                 aiHandArea.height / 2)
-
-                var c = flyingCardComponent.createObject(animationLayer, {
-                    cardId: cardId,
-                    faceUp: false,
-                    flipToFaceUpOnTable: true,
-                    flightRole: "aiToTable",
-                    flightDuration: tableFlightDuration,
-                    startScale: 1.0,
-                    endScale: 1.0,
-                    x: start.x,
-                    y: start.y,
-                    z: 1000,
-                    opacity: 1.0
-                })
-
-                c.flyToTable()
+                var obj = flyingCardComponent.createObject(animationLayer, {
+                                                            cardId: cardId,
+                                                            flightRole: "aiToTable",
+                                                            x: aiHandArea.x + aiHandArea.width/2,
+                                                            y: aiHandArea.y + aiHandArea.height/2,
+                                                            opacity: 1,
+                                                            visible: true
+                                                        })
+                if (!mainPage.flyingById) mainPage.flyingById = ({})
+                mainPage.flyingById[cardId] = obj
             }
 
             
@@ -219,13 +265,20 @@ function scheduleDealResumeAfterCapture(nCards) {
     if (nCards === undefined || nCards === null) nCards = 0;
 
     // Capture flight uses pileFlightDuration with per-card stagger of 80ms.
-    var stagger = 80;
-    var buffer = dur(320); // small settle time after landing/rotation
-    var total = pileFlightDuration + Math.max(0, (nCards - 1)) * stagger + buffer;
+function tryResumeDealing(reason) {
+    // Resume dealing only when BOTH: capture flights are done AND our time gate has elapsed.
+    if (mainPage.pileFlightsInProgress === 0 && mainPage.captureGateTimerFired) {
+        mainPage.dealingPaused = false
+        mainPage.capturePending = false
 
-    if (total < dur(250)) total = dur(250);
-
-    dealResumeTimer.interval = total;
+        // Block AI from starting the next trick until the full visual deal phase is expected to be done.
+        if (mainPage.dealPhaseMs > 0) {
+            mainPage.dealPhaseActive = true
+            dealPhaseTimer.interval = mainPage.dealPhaseMs
+            dealPhaseTimer.restart()
+        }
+    }
+}
     dealResumeTimer.restart();
 }
 
@@ -233,69 +286,71 @@ function scheduleDealResumeAfterCapture(nCards) {
 function tryResumeDealing(reason) {
     // Resume dealing only when BOTH: capture flights are done AND our time gate has elapsed.
     if (mainPage.pileFlightsInProgress === 0 && mainPage.captureGateTimerFired) {
-        if (mainPage.dealingPaused || mainPage.capturePending) {
-            console.info('[DEAL_GATE] RESUME dealing (reason=' + reason + ') elapsedMs=', (Date.now() - mainPage.captureGateStartedAt))
-        }
         mainPage.dealingPaused = false
         mainPage.capturePending = false
-    } else {
-        console.info('[DEAL_GATE] keep paused (reason=' + reason + ') timerFired=', mainPage.captureGateTimerFired,
-                     ' flights=', mainPage.pileFlightsInProgress)
     }
 }
 
-function animateTableCardsToWinner() {
-                if (engine.tableCards.length < 2)
-                    return
 
-                var playerWon = playerWonCurrentTrick()
-                var target = playerWon ? playerWonDealPoint : aiWonDealPoint
-
-
-                mainPage.dealingPaused = true
-                mainPage.capturePending = true
-                mainPage.pileFlightsInProgress = engine.tableCards.length
-
-                console.info("[DEAL_GATE] CAPTURE start (live) nCards=", engine.tableCards.length,
-                             "tableFlightDuration=", tableFlightDuration,
-                             "pileFlightDuration=", pileFlightDuration)
-
-                scheduleDealResumeAfterCapture(engine.tableCards.length);
-                for (var i = 0; i < engine.tableCards.length; ++i) {
-                    var card = engine.tableCards[i]
-
-                    var start = tableDealPoint.mapToItem(animationLayer,
-                                                         (i === 0 ? -Theme.paddingLarge : Theme.paddingLarge),
-                                                         -Theme.paddingMedium)
-
-                    var c = flyingCardComponent.createObject(animationLayer, {
-                        cardId: card.id,
-                        faceUp: true,                  // always start faceUp
-                        wonByPlayer: playerWon,
-                        shouldFlipMidFlight: true,     // always flip mid-flight
-                        flightRole: "toPile",
-                        flightDuration: pileFlightDuration,
-                        startDelay: i * dur(120),
-                        startScale: 1.0,
-                        endScale: 0.5,
-                        x: start.x,
-                        y: start.y,
-                        z: 900
-                    })
-
-                    c.flyToPoint(target)
+            function _spawnToPileNow(cardId, playerWon, startDelay, startX, startY) {
+                // remove any landed to-table clone for this cardId (prevents overlay staying on top)
+                if (mainPage.landedFlyingCards[cardId]) {
+                    try { mainPage.landedFlyingCards[cardId].destroy(); } catch(e) {}
+                    delete mainPage.landedFlyingCards[cardId]
                 }
+                // if a previous toPile clone exists for same cardId, destroy it (shouldn't happen, but safe)
+                if (mainPage.flyingByCardId[cardId] && mainPage.flyingByCardId[cardId].flightRole === "toPile") {
+                    try { mainPage.flyingByCardId[cardId].destroy(); } catch(e) {}
+                    delete mainPage.flyingByCardId[cardId]
+                }
+
+                var target = playerWon ? playerWonDealPoint : aiWonDealPoint
+                var f = flyingCardComponent.createObject(animationLayer, {
+                    cardId: cardId,
+                    faceUp: true,
+                    wonByPlayer: playerWon,
+                    shouldFlipMidFlight: true,
+                    flightRole: "toPile",
+                    flightDuration: pileFlightDuration,
+                    startDelay: startDelay,
+                    startScale: 1.0,
+                    endScale: 0.5,
+                    x: startX,
+                    y: startY,
+                    z: 900
+                })
+                mainPage.flyingByCardId[cardId] = f
+                f.flyToPoint(target)
             }
-            function animateTableCardsToWinnerFrom(cards) {
+
+            function _requestToPile(cardId, playerWon, startDelay, startX, startY) {
+                var active = mainPage.flyingByCardId[cardId]
+                if (active && (active.flightRole === "playerToTable" || active.flightRole === "aiToTable")) {
+                    // card is still flying to table; wait until it lands, then spawn toPile
+                    mainPage.pendingToPile[cardId] = {
+                        playerWon: playerWon,
+                        startDelay: startDelay,
+                        startX: startX,
+                        startY: startY
+                    }
+                    return
+                }
+                mainPage._spawnToPileNow(cardId, playerWon, startDelay, startX, startY)
+            }
+
+function animateTableCardsToWinner() {
+        // Snapshot current table cards (engine.tableCards changes during capture)
+        var snapshot = []
+        for (var i = 0; i < engine.tableCards.length; i++) snapshot.push(engine.tableCards[i])
+        animateTableCardsToWinnerFrom(snapshot)
+    }
+
+    function animateTableCardsToWinnerFrom(cards) {
                 if (!cards || cards.length < 2)
                     return
                 mainPage.dealingPaused = true
                 mainPage.capturePending = true
                 mainPage.pileFlightsInProgress = cards.length
-
-                console.info("[DEAL_GATE] CAPTURE start (snapshot) nCards=", cards.length,
-                             "tableFlightDuration=", tableFlightDuration,
-                             "pileFlightDuration=", pileFlightDuration)
 
                 scheduleDealResumeAfterCapture(cards.length); // Winner = last hitter in this pile (same logic as playerWonCurrentTrick but using snapshot)
                 var cardToHit = cards[0].rank
@@ -306,6 +361,11 @@ function animateTableCardsToWinner() {
                         lastHitterPlayedBy = cc.playedBy
                 }
                 var playerWon = (lastHitterPlayedBy === 0)
+                // Dealing order: trick winner draws first (visual only)
+                mainPage.dealFirstSide = playerWon ? 0 : 1
+                // Block the other side long enough for up to 3 winner cards to finish animating
+                mainPage.dealLoserExtraMs = (2 * dur(220)) + dur(340)
+                mainPage.dealPhaseMs = mainPage.dealLoserExtraMs + (3 * dur(440)) + dur(320) + dur(200)
                 var target = playerWon ? playerWonDealPoint : aiWonDealPoint
 
                 for (var j = 0; j < cards.length; ++j) {
@@ -314,23 +374,9 @@ function animateTableCardsToWinner() {
                         (j === 0 ? -Theme.paddingLarge : Theme.paddingLarge),
                         -Theme.paddingMedium)
 
-                    var f = flyingCardComponent.createObject(animationLayer, {
-                        cardId: card.id,
-                        faceUp: true,
-                        wonByPlayer: playerWon,
-                        shouldFlipMidFlight: true,
-                        flightRole: "toPile",
-                        flightDuration: pileFlightDuration,
-                        startDelay: j * dur(120),
-                        startScale: 1.0,
-                        endScale: 0.5,
-                        x: start.x,
-                        y: start.y,
-                        z: 900
-                    })
-                    f.flyToPoint(target)
+                    mainPage._requestToPile(card.id, playerWon, j * dur(120), start.x, start.y)
                 }
-            }
+}
             Component {
                 id: flyingCardComponent
 
@@ -359,13 +405,16 @@ function animateTableCardsToWinner() {
 //                        z: 1
 //                    }
 
-                    transform: Rotation {
-                        id: flip
+                    transform: Scale {
+                        id: flipScale
                         origin.x: flyingCard.width / 2
                         origin.y: flyingCard.height / 2
-                        axis { x: 0; y: 1; z: 0 }
-                        angle: 0
+                        xScale: flyingCard.flipX
+                        yScale: 1
                     }
+
+                    // Avoid RotationY 90° edge-on vanishing on Sailfish: use xScale "flip"
+                    property real flipX: 1.0
 
                     Timer {
                         id: startDelayTimer
@@ -414,14 +463,13 @@ var target = tableDealPoint.mapToItem(animationLayer, 0, 0)
 
                     Timer {
                         id: midFlipTimer
-                        interval: flightDuration / 2
+                        interval: Math.floor(flightDuration * 0.85)
                         repeat: false
                         onTriggered: {
                             if (flipToFaceUpOnTable) flipUpAnim.start()
                             else flipAnim.start() // flip-to-face-down for pile
                         }
                     }
-
                     ParallelAnimation {
                         id: flyAnim
 
@@ -470,21 +518,33 @@ var target = tableDealPoint.mapToItem(animationLayer, 0, 0)
                                 mainPage.capturePending = true
                                 mainPage.phase = "pause"
                                 mainPage.pendingTrickResolve = false
+                                exitTimer.restart()
                                 resolveTrickTimer.restart()   // this is your trickResolveDelay pause
                             }
 
                             // 2) Flying to winner pile
                             if (flyingCard.flightRole === "toPile") {
                                 mainPage.pileFlightsInProgress--
-                                console.info("[DEAL_GATE] pile flight finished cardId=", flyingCard.cardId,
-                                             "remaining=", mainPage.pileFlightsInProgress)
                                 if (mainPage.pileFlightsInProgress === 0) {
                                     mainPage.phase = "idle"
                                 }
                                 mainPage.tryResumeDealing("flight")
                             }
-
-                            flyingCard.destroy()
+                            // Keep landed to-table flying cards alive until resolveTrickTimer starts (prevents blink gap)
+                            if (flyingCard.flightRole === "playerToTable" || flyingCard.flightRole === "aiToTable") {
+                                // If the static table delegate already exists (AI often creates it before the flight finishes),
+                                // destroy the flying clone immediately after landing. Otherwise keep it until the delegate arrives.
+                                var tc = mainPage.tableCardRefs[flyingCard.cardId]
+                                if (tc) {
+                                    tc.visible = true
+                                    tc.opacity = 1
+                                    flyingCard.destroy(1)
+                                } else {
+                                    mainPage.landedFlyingCards[flyingCard.cardId] = flyingCard
+                                }
+                            } else {
+                                flyingCard.destroy()
+                            }
                         }
 
                     }
@@ -493,23 +553,21 @@ var target = tableDealPoint.mapToItem(animationLayer, 0, 0)
                         id: flipAnim
 
                         PropertyAnimation {
-                            target: flip
-                            property: "angle"
-                            from: 0
-                            to: 90
+                            target: flyingCard
+                            property: "flipX"
+                            from: 1.0
+                            to: 0.30
                             duration: 80
                             easing.type: Easing.InQuad
                         }
 
-                        ScriptAction {
-                            script: flyingCard.faceUp = false
-                        }
+                        ScriptAction { script: flyingCard.faceUp = false }
 
                         PropertyAnimation {
-                            target: flip
-                            property: "angle"
-                            from: 90
-                            to: 0
+                            target: flyingCard
+                            property: "flipX"
+                            from: 0.30
+                            to: 1.0
                             duration: 80
                             easing.type: Easing.OutQuad
                         }
@@ -519,23 +577,21 @@ var target = tableDealPoint.mapToItem(animationLayer, 0, 0)
                         id: flipUpAnim
 
                         PropertyAnimation {
-                            target: flip
-                            property: "angle"
-                            from: 0
-                            to: 90
+                            target: flyingCard
+                            property: "flipX"
+                            from: 1.0
+                            to: 0.30
                             duration: 80
                             easing.type: Easing.InQuad
                         }
 
-                        ScriptAction {
-                            script: flyingCard.faceUp = true
-                        }
+                        ScriptAction { script: flyingCard.faceUp = true }
 
                         PropertyAnimation {
-                            target: flip
-                            property: "angle"
-                            from: 90
-                            to: 0
+                            target: flyingCard
+                            property: "flipX"
+                            from: 0.30
+                            to: 1.0
                             duration: 80
                             easing.type: Easing.OutQuad
                         }
@@ -678,6 +734,15 @@ var target = tableDealPoint.mapToItem(animationLayer, 0, 0)
                         height: Theme.itemSizeLarge * 1.4
                         z: 0.5
 
+                        Label {
+                            id: aiZsirLabel
+                            text: engine.cpuScore
+                            visible: Number(engine.cpuScore) > 0
+                            anchors.horizontalCenter: parent.horizontalCenter
+                            y: -height - Theme.paddingSmall
+                            font.pixelSize: Theme.fontSizeSmall
+                        }
+
                         // AI won card pile area
                         Rectangle {
                             anchors.fill: parent
@@ -765,8 +830,10 @@ var target = tableDealPoint.mapToItem(animationLayer, 0, 0)
                                 property real spacing: width * 0.5
                                 property real handWidth: (count - 1) * spacing + width
 
-                                property bool bornAtDeck: (!mainPage.dealingPaused && !mainPage.seenAiIds[modelData.id])
-                                property int dealDelay: index * dur(220)
+                                // Must NOT be a binding (it can flip mid-flow when seenAiIds updates).
+                                // We compute it once per delegate in Component.onCompleted.
+                                property bool bornAtDeck: false
+                                property int dealDelay: (index * dur(220)) + ((bornAtDeck && mainPage.dealFirstSide === 0) ? mainPage.dealLoserExtraMs : 0)  // AI delays when PLAYER draws first
                                 property real finalX: (aiHandArea.width - handWidth) / 2 + index * spacing
                                 property real finalY: 0
 
@@ -779,11 +846,11 @@ var target = tableDealPoint.mapToItem(animationLayer, 0, 0)
                                 opacity: 0.9
 
                                 Behavior on x {
-                                    NumberAnimation { duration: dur(200); easing.type: Easing.OutCubic }
+                                    NumberAnimation { duration: (mainPage.layoutFrozen ? 0 : dur(200)); easing.type: Easing.OutCubic }
                                 }
 
                                 Behavior on y {
-                                    NumberAnimation { duration: dur(240); easing.type: Easing.OutCubic }
+                                    NumberAnimation { duration: (mainPage.layoutFrozen ? 0 : dur(240)); easing.type: Easing.OutCubic }
                                 }
 
                                 function startDealIfNeeded() {
@@ -810,11 +877,8 @@ var target = tableDealPoint.mapToItem(animationLayer, 0, 0)
                                 Component.onCompleted: {
                                      // Decide once per delegate if this card should animate from deck.
                                      bornAtDeck = mainPage.freshRound || (!mainPage.seenAiIds[modelData.id])
-                                     console.info("[DEAL_GATE] AI card delegate created id=", modelData.id,
-                                                  "dealingPaused=", mainPage.dealingPaused,
-                                                  "capturePending=", mainPage.capturePending,
-                                                  "bornAtDeck=", bornAtDeck)
-
+                                     // Prevent flicker: keep newborn cards truly hidden at deck until deal starts
+                                     if (bornAtDeck) { aiCard.visible = false; aiCard.opacity = 0.0 }
 
                                      if (mainPage.dealingPaused || mainPage.capturePending) {
                                         // During capture/deal-pause: only gate newly dealt cards.
@@ -836,12 +900,11 @@ var target = tableDealPoint.mapToItem(animationLayer, 0, 0)
                                     running: false
                                     onTriggered: {
                                         if (!mainPage.dealingPaused && !mainPage.capturePending && mainPage.pileFlightsInProgress === 0) {
-                                             console.info("[DEAL_GATE] AI waitDealTimer release id=", modelData.id,
-                                                          "bornAtDeck=", bornAtDeck)
                                              stop();
                                              if (bornAtDeck) {
                                                  mainPage.seenAiIds[modelData.id] = true
                                                  opacity = 1.0
+                                        aiCard.visible = true
                                                  dealTimer.restart()
                                              } else {
                                                  opacity = 1.0
@@ -871,6 +934,8 @@ var target = tableDealPoint.mapToItem(animationLayer, 0, 0)
                                     interval: dealDelay
                                     repeat: false
                                     onTriggered: {
+                                        aiCard.visible = true
+                                        aiCard.opacity = 1.0
                                         // Start position = centered on dealOrigin
                                         dealOffsetX = (aiHandArea.dealOrigin.x - width / 2) - finalX
                                         dealOffsetY = (aiHandArea.dealOrigin.y - height / 2) - finalY
@@ -979,10 +1044,9 @@ var target = tableDealPoint.mapToItem(animationLayer, 0, 0)
                         z: 0
 
                         onChildrenChanged: {
-                            if (children.length === 2) {
-                                // Cards just landed → wait briefly
-                                exitTimer.restart()
-                            }
+                            // Note: static table cards can appear immediately when engine.tableCards updates,
+                            // while the flying clone is still in flight. Starting exit here causes a visible
+                            // disappear/reappear glitch. We start exit only when the flying cards report landed.
                         }
 
                         Connections {
@@ -998,7 +1062,12 @@ var target = tableDealPoint.mapToItem(animationLayer, 0, 0)
                                         mainPage.aiFlyingActive = true
                                         mainPage.hideAiStaticId = last.id
                                         mainPage.pendingAiCardId = last.id
-                                        aiSpawnTimer.restart()
+            if (mainPage.dealPhaseActive) {
+                // Defer AI play animation until dealing visuals complete
+                mainPage.aiSpawnDeferred = true
+            } else {
+                aiSpawnTimer.restart()
+            }
                                     }
                                 } else if (len === 0 && lastTableCount > 0) {
                                     // Table cleared: animate capture from snapshot
@@ -1015,22 +1084,33 @@ var target = tableDealPoint.mapToItem(animationLayer, 0, 0)
                                 id: tableCard
                                 cardId: modelData.id
                                 faceUp: true
+                                Component.onCompleted: {
+                                    mainPage.tableCardRefs[cardId] = tableCard
+                                    // If a flying-to-table clone exists for this cardId, destroy it now.
+                                    var landed = mainPage.landedFlyingCards[cardId]
+                                    if (landed) {
+                                        landed.destroy()
+                                        delete mainPage.landedFlyingCards[cardId]
+                                    }
+
+                                }
+                                Component.onDestruction: { if (mainPage.tableCardRefs[cardId] === tableCard) delete mainPage.tableCardRefs[cardId] }
 
                                 // Stacking + layout for up to 4 cards
                                 z: index
 
                                 // Fan/stack so all cards remain visible
-                                x: 0
+                                x: -width/2
                                 y: -height / 2 + index * Theme.paddingMedium * 1.10
                                 rotation: -12 + index * 6
 
                                 // Hide the newest AI table card while its flying clone is animating
-                                opacity: (modelData.playedBy === 1 && mainPage.aiFlyingActive && modelData.id === mainPage.hideAiStaticId) ? 0.0 : 1.0
+                                opacity: (!mainPage.animationsEnabled) ? 1.0 : ((modelData.playedBy === 1 && mainPage.aiFlyingActive && modelData.id === mainPage.hideAiStaticId) ? 0.0 : 1.0)
 
                                 Behavior on x { NumberAnimation { duration: 220; easing.type: Easing.OutCubic } }
                                 Behavior on y { NumberAnimation { duration: 220; easing.type: Easing.OutCubic } }
                                 Behavior on rotation { NumberAnimation { duration: 220; easing.type: Easing.OutCubic } }
-                                Behavior on opacity { NumberAnimation { duration: 120 } }
+                                Behavior on opacity { NumberAnimation { duration: 0 } }
                             }
                         }
                     }
@@ -1055,6 +1135,13 @@ var target = tableDealPoint.mapToItem(animationLayer, 0, 0)
                         interval: mainPage.trickResolveDelay
                         repeat: false
                         onTriggered: {
+                            // Remove landed flying-to-table clones now that static table delegates exist
+                            for (var k in mainPage.landedFlyingCards) {
+                                var obj = mainPage.landedFlyingCards[k];
+                                if (obj) obj.destroy();
+                            }
+                            mainPage.landedFlyingCards = ({})
+
                             // Delay is over, NOW fly table cards to the winner pile
                             mainPage.phase = "toPile"
                             animateTableCardsToWinner()
@@ -1074,6 +1161,15 @@ var target = tableDealPoint.mapToItem(animationLayer, 0, 0)
                         width: Theme.itemSizeLarge
                         height: Theme.itemSizeLarge * 1.4
                         z: 0.5
+
+                        Label {
+                            id: playerZsirLabel
+                            text: engine.playerScore
+                            visible: Number(engine.playerScore) > 0
+                            anchors.horizontalCenter: parent.horizontalCenter
+                            y: -height - Theme.paddingSmall
+                            font.pixelSize: Theme.fontSizeSmall
+                        }
 
                         // Playe won cards pile area
                         Rectangle {
@@ -1159,7 +1255,7 @@ var target = tableDealPoint.mapToItem(animationLayer, 0, 0)
                         }
 
                         Behavior on scale {
-                            NumberAnimation { duration: dur(200); easing.type: Easing.OutCubic }
+                            NumberAnimation { duration: (mainPage.layoutFrozen ? 0 : dur(200)); easing.type: Easing.OutCubic }
                         }
 
                         opacity: engine.roundResult.length > 0
@@ -1209,7 +1305,7 @@ var target = tableDealPoint.mapToItem(animationLayer, 0, 0)
                                 property real spacing: card.width * 0.6
                                 property real handWidth: (count - 1) * spacing + card.width
                                 property bool bornAtDeck: false
-                                property int dealDelay: index * dur(220)
+                                property int dealDelay: (index * dur(220)) + ((bornAtDeck && mainPage.dealFirstSide === 1) ? mainPage.dealLoserExtraMs : 0)  // PLAYER delays when AI draws first
                                 property real dealOffsetX: 0
                                 property real dealOffsetY: 0
                                 property bool isBeingPlayed: false
@@ -1238,24 +1334,27 @@ var target = tableDealPoint.mapToItem(animationLayer, 0, 0)
                                 onClicked: {
                                     if (bornAtDeck || opacity <= 0.2) return
                                     if (isBeingPlayed) return            // prevent double-tap spam
-                                    isBeingPlayed = true                 // hide immediately
+                                    if (!mainPage.animationsEnabled) {
+                                        playTimer.start()
+                                        return
+                                    }
+                                    isBeingPlayed = true                 // hide immediately (we spawn a flying clone)
                                     var p = mouseArea.mapToItem(animationLayer,
                                                                 mouseArea.width / 2,
                                                                 mouseArea.height / 2)
                                     spawnFlyingCard(card.cardId, p)
                                     playTimer.start()
                                 }
-
                                 onPressed: card.pressed = true
                                 onReleased: card.pressed = false
                                 onCanceled: card.pressed = false
 
                                 Behavior on x {
-                                    NumberAnimation { duration: dur(200); easing.type: Easing.OutCubic }
+                                    NumberAnimation { duration: (mainPage.layoutFrozen ? 0 : dur(200)); easing.type: Easing.OutCubic }
                                 }
 
                                 Behavior on y {
-                                    NumberAnimation { duration: dur(240); easing.type: Easing.OutCubic }
+                                    NumberAnimation { duration: (mainPage.layoutFrozen ? 0 : dur(240)); easing.type: Easing.OutCubic }
                                 }
 
                                 function startDealIfNeeded() {
@@ -1289,11 +1388,8 @@ var target = tableDealPoint.mapToItem(animationLayer, 0, 0)
                                      // Decide once per delegate if this card should animate from deck.
                                      // Important: do NOT bind bornAtDeck to seen/dealingPaused, otherwise it flips mid-flow.
                                      bornAtDeck = mainPage.freshRound || (!mainPage.seenPlayerIds[modelData.id])
-                                     console.info("[DEAL_GATE] PLAYER card delegate created id=", modelData.id,
-                                                  "dealingPaused=", mainPage.dealingPaused,
-                                                  "capturePending=", mainPage.capturePending,
-                                                  "bornAtDeck=", bornAtDeck)
-
+                                     // Prevent flicker / phantom taps: keep newborn cards truly hidden at deck until deal starts
+                                     if (bornAtDeck) { mouseArea.visible = false; mouseArea.opacity = 0.0 }
 
                                      // After first hand is created, we are no longer in fresh round
                                     // (this runs multiple times; safe)
@@ -1320,13 +1416,12 @@ var target = tableDealPoint.mapToItem(animationLayer, 0, 0)
                                     running: false
                                     onTriggered: {
                                         if (!mainPage.dealingPaused && !mainPage.capturePending && mainPage.pileFlightsInProgress === 0) {
-                                             console.info("[DEAL_GATE] PLAYER waitDealTimer release id=", modelData.id,
-                                                          "bornAtDeck=", bornAtDeck)
                                              stop()
                                              if (bornAtDeck) {
                                                  // Start the actual deal animation now (even if seen was set earlier).
                                                  mainPage.seenPlayerIds[modelData.id] = true
                                                  mouseArea.opacity = 1.0
+                                        mouseArea.visible = true
                                                  dealTimer.restart()
                                              } else {
                                                  // Delegate recreated while paused; restore visibility.
@@ -1357,6 +1452,8 @@ var target = tableDealPoint.mapToItem(animationLayer, 0, 0)
                                     interval: dealDelay
                                     repeat: false
                                     onTriggered: {
+                                        mouseArea.visible = true
+                                        mouseArea.opacity = 1.0
                                         if (bornAtDeck) {
                                             card.faceUp = false        // ensure starts faceDown
                                             dealFlipTimer.restart()    // flip halfway through dealAnim
@@ -1438,7 +1535,7 @@ var target = tableDealPoint.mapToItem(animationLayer, 0, 0)
                                             target: dealFlip
                                             property: "angle"
                                             from: 0
-                                            to: 90
+                                            to: 80
                                             duration: 80
                                             easing.type: Easing.InQuad
                                         }
@@ -1446,7 +1543,7 @@ var target = tableDealPoint.mapToItem(animationLayer, 0, 0)
                                         PropertyAnimation {
                                             target: dealFlip
                                             property: "angle"
-                                            from: 90
+                                            from: 80
                                             to: 0
                                             duration: 80
                                             easing.type: Easing.OutQuad
@@ -1557,51 +1654,20 @@ var target = tableDealPoint.mapToItem(animationLayer, 0, 0)
 
                     Label {
                         id: playerScoreLabel
-                        text: "You: " + engine.playerScore
+                                                text: appSettings.ai1Name
                         font.pixelSize: Theme.fontSizeSmall
                         color: Theme.primaryColor
-                        Behavior on opacity {
-                            NumberAnimation { duration: 120 }
-                        }
+                        Behavior on opacity { NumberAnimation { duration: 0 } }
 
-                        property int lastScore: engine.playerScore
-
-                        onTextChanged: {
-                            if (engine.playerScore > lastScore) {
-                                playerScorePop.restart()
-                            }
-                            lastScore = engine.playerScore
-                        }
-
-                        SequentialAnimation {
-                            id: playerScorePop
-
-                            PropertyAnimation {
-                                target: playerScoreLabel
-                                property: "scale"
-                                to: 1.15
-                                duration: 120
-                                easing.type: Easing.OutCubic
-                            }
-
-                            PropertyAnimation {
-                                target: playerScoreLabel
-                                property: "scale"
-                                to: 1.0
-                                duration: 160
-                                easing.type: Easing.OutCubic
-                            }
-                        }
                     }
 
                     Label {
                         id: cpuScoreLabel
+                        visible: false
                         text: appSettings.ai1Name + ": " + engine.cpuScore
                         font.pixelSize: Theme.fontSizeSmall
                         color: Theme.secondaryColor
-                        Behavior on opacity {
-                            NumberAnimation { duration: 120 }
-                        }
+                        Behavior on opacity { NumberAnimation { duration: 0 } }
 
                         property int lastScore: engine.cpuScore
 
@@ -1656,7 +1722,7 @@ var target = tableDealPoint.mapToItem(animationLayer, 0, 0)
                     scale: text.length > 0 ? 1.1 : 1.0
 
                     Behavior on scale {
-                        NumberAnimation { duration: dur(200); easing.type: Easing.OutCubic }
+                        NumberAnimation { duration: (mainPage.layoutFrozen ? 0 : dur(200)); easing.type: Easing.OutCubic }
                     }
                 }
                 
