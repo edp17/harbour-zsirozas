@@ -51,13 +51,10 @@ ApplicationWindow
             property string hideAiStaticId: ""
 
             property string pendingAiCardId: ""
-            property bool aiSpawnDeferred: false
             property bool dealingPaused: false
             property bool capturePending: false
             property var pendingToPile: ({})  // cardId -> {playerWon, startDelay, startX, startY}
 property bool layoutFrozen: (dealingPaused || capturePending || pileFlightsInProgress > 0)
-property string lifecyclePhase: "play"      // "play" | "resolve" | "deal"
-property bool busy: (dealingPaused || capturePending || pileFlightsInProgress > 0 || (animationsEnabled && dealPhaseActive))
             property int pileFlightsInProgress: 0
 property var landedFlyingCards: ({})
 property var flyingByCardId: ({})
@@ -93,7 +90,7 @@ property int dealPhaseEndsAtMs: 0
             property int tableFlightDuration: effDur(appSettings.tableFlightDuration, 250)
             property bool dealPhaseActive: false   // blocks AI from playing next card until dealing visuals finish
             property int dealPhaseMs: 0
-            property int pileFlightDuration: (animationsEnabled ? (tableFlightDuration + 250) : 0)   // ms
+            property int pileFlightDuration: tableFlightDuration + 250   // ms
             property string ai1Name: appSettings.ai1Name
 
                         function effDur(v, baseMs) {
@@ -170,8 +167,7 @@ function resetSeen() {
                 onTriggered: {
                     if (mainPage.dealPhaseActive && Date.now() >= mainPage.dealPhaseEndsAtMs) {
                         mainPage.dealPhaseActive = false
-                        mainPage.lifecyclePhase = "play"
-                        if (mainPage.aiSpawnDeferred && mainPage.pendingAiCardId) {
+                        if (mainPage.aiSpawnDeferred && mainPage.pendingAiCardId >= 0) {
                             mainPage.aiSpawnDeferred = false
                             aiSpawnTimer.restart()
                         }
@@ -274,12 +270,10 @@ function tryResumeDealing(reason) {
     if (mainPage.pileFlightsInProgress === 0 && mainPage.captureGateTimerFired) {
         mainPage.dealingPaused = false
         mainPage.capturePending = false
-        if (mainPage.dealPhaseMs <= 0) mainPage.lifecyclePhase = "play"
 
         // Block AI from starting the next trick until the full visual deal phase is expected to be done.
         if (mainPage.dealPhaseMs > 0) {
             mainPage.dealPhaseActive = true
-            mainPage.lifecyclePhase = "deal"
             dealPhaseTimer.interval = mainPage.dealPhaseMs
             dealPhaseTimer.restart()
         }
@@ -294,7 +288,6 @@ function tryResumeDealing(reason) {
     if (mainPage.pileFlightsInProgress === 0 && mainPage.captureGateTimerFired) {
         mainPage.dealingPaused = false
         mainPage.capturePending = false
-        if (mainPage.dealPhaseMs <= 0) mainPage.lifecyclePhase = "play"
     }
 }
 
@@ -357,7 +350,6 @@ function animateTableCardsToWinner() {
                     return
                 mainPage.dealingPaused = true
                 mainPage.capturePending = true
-                mainPage.lifecyclePhase = "resolve"
                 mainPage.pileFlightsInProgress = cards.length
 
                 scheduleDealResumeAfterCapture(cards.length); // Winner = last hitter in this pile (same logic as playerWonCurrentTrick but using snapshot)
@@ -524,7 +516,6 @@ var target = tableDealPoint.mapToItem(animationLayer, 0, 0)
                                 // The engine may already update hands before the capture animation starts.
                                 mainPage.dealingPaused = true
                                 mainPage.capturePending = true
-                mainPage.lifecyclePhase = "resolve"
                                 mainPage.phase = "pause"
                                 mainPage.pendingTrickResolve = false
                                 exitTimer.restart()
@@ -864,15 +855,6 @@ var target = tableDealPoint.mapToItem(animationLayer, 0, 0)
 
                                 function startDealIfNeeded() {
                                     if (mainPage.seenAiIds[modelData.id]) {
-                                        aiCard.visible = true
-                                        aiCard.opacity = 1.0
-                                        return
-                                    }
-
-                                    if (!mainPage.animationsEnabled) {
-                                        mainPage.seenAiIds[modelData.id] = true
-                                        bornAtDeck = false
-                                        aiCard.visible = true
                                         aiCard.opacity = 1.0
                                         return
                                     }
@@ -895,13 +877,6 @@ var target = tableDealPoint.mapToItem(animationLayer, 0, 0)
                                 Component.onCompleted: {
                                      // Decide once per delegate if this card should animate from deck.
                                      bornAtDeck = mainPage.freshRound || (!mainPage.seenAiIds[modelData.id])
-                                     if (!mainPage.animationsEnabled) {
-                                         mainPage.seenAiIds[modelData.id] = true
-                                         bornAtDeck = false
-                                         aiCard.visible = true
-                                         aiCard.opacity = 1.0
-                                         return
-                                     }
                                      // Prevent flicker: keep newborn cards truly hidden at deck until deal starts
                                      if (bornAtDeck) { aiCard.visible = false; aiCard.opacity = 0.0 }
 
@@ -1087,10 +1062,7 @@ var target = tableDealPoint.mapToItem(animationLayer, 0, 0)
                                         mainPage.aiFlyingActive = true
                                         mainPage.hideAiStaticId = last.id
                                         mainPage.pendingAiCardId = last.id
-            if (mainPage.busy || mainPage.lifecyclePhase !== "play") {
-                // Defer AI play visuals until system is in play phase
-                mainPage.aiSpawnDeferred = true
-            } else if (mainPage.dealPhaseActive) {
+            if (mainPage.dealPhaseActive) {
                 // Defer AI play animation until dealing visuals complete
                 mainPage.aiSpawnDeferred = true
             } else {
@@ -1324,7 +1296,6 @@ var target = tableDealPoint.mapToItem(animationLayer, 0, 0)
                                 id: mouseArea
 
                                 enabled: engine.playerInputEnabled &&
-                                         !mainPage.busy && mainPage.lifecyclePhase === "play" &&
                                          (!engine.canLeave || modelData.rank === engine.cardToHit || modelData.rank === 7) &&
                                          !bornAtDeck && opacity > 0.2
 
@@ -1362,7 +1333,6 @@ var target = tableDealPoint.mapToItem(animationLayer, 0, 0)
 
                                 onClicked: {
                                     if (bornAtDeck || opacity <= 0.2) return
-                                    if (engine.canLeave && modelData.rank !== engine.cardToHit && modelData.rank !== 7) return
                                     if (isBeingPlayed) return            // prevent double-tap spam
                                     if (!mainPage.animationsEnabled) {
                                         playTimer.start()
@@ -1390,15 +1360,6 @@ var target = tableDealPoint.mapToItem(animationLayer, 0, 0)
                                 function startDealIfNeeded() {
                                     // If we already handled this card, just make sure it is visible.
                                     if (mainPage.seenPlayerIds[modelData.id]) {
-                                        mouseArea.visible = true
-                                        mouseArea.opacity = 1.0
-                                        return
-                                    }
-
-                                    if (!mainPage.animationsEnabled) {
-                                        mainPage.seenPlayerIds[modelData.id] = true
-                                        bornAtDeck = false
-                                        mouseArea.visible = true
                                         mouseArea.opacity = 1.0
                                         return
                                     }
@@ -1427,14 +1388,6 @@ var target = tableDealPoint.mapToItem(animationLayer, 0, 0)
                                      // Decide once per delegate if this card should animate from deck.
                                      // Important: do NOT bind bornAtDeck to seen/dealingPaused, otherwise it flips mid-flow.
                                      bornAtDeck = mainPage.freshRound || (!mainPage.seenPlayerIds[modelData.id])
-                                     if (!mainPage.animationsEnabled) {
-                                         mainPage.seenPlayerIds[modelData.id] = true
-                                         bornAtDeck = false
-                                         mouseArea.visible = true
-                                         mouseArea.opacity = 1.0
-                                         mainPage.freshRound = false
-                                         return
-                                     }
                                      // Prevent flicker / phantom taps: keep newborn cards truly hidden at deck until deal starts
                                      if (bornAtDeck) { mouseArea.visible = false; mouseArea.opacity = 0.0 }
 
@@ -1609,7 +1562,7 @@ var target = tableDealPoint.mapToItem(animationLayer, 0, 0)
                         anchors.bottom: handArea.top
                         anchors.bottomMargin: Theme.paddingLarge
                         visible: engine && engine.canLeave
-                        enabled: engine && engine.canLeave && !mainPage.busy && mainPage.lifecyclePhase === "play"
+                        enabled: engine && engine.canLeave
                         onClicked: engine.playerLeave()
                         z: 50
                     }
