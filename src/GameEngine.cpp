@@ -80,6 +80,20 @@ void GameEngine::setAiPlayDelay(int ms)
     emit aiPlayDelayChanged();
 }
 
+void GameEngine::setAiDifficulty(int difficulty)
+{
+    if (difficulty < static_cast<int>(AiDifficulty::Easy))
+        difficulty = static_cast<int>(AiDifficulty::Easy);
+    if (difficulty > static_cast<int>(AiDifficulty::Expert))
+        difficulty = static_cast<int>(AiDifficulty::Expert);
+
+    if (m_aiDifficulty == difficulty)
+        return;
+
+    m_aiDifficulty = difficulty;
+    emit aiDifficultyChanged();
+}
+
 bool GameEngine::playerInputEnabled() const
 {
     return m_roundResult.isEmpty()
@@ -527,18 +541,153 @@ void GameEngine::maybeScheduleCpuMove()
     m_aiTimer.start(m_aiPlayDelay);
 }
 
+QVector<int> GameEngine::legalCpuMoves() const
+{
+    QVector<int> legal;
+    legal.reserve(m_cpu.size());
+
+    if (m_cpu.isEmpty())
+        return legal;
+
+    // First move of pile: any card is legal
+    if (m_movesInPile == 0) {
+        for (int i = 0; i < m_cpu.size(); ++i)
+            legal.append(i);
+        return legal;
+    }
+
+    // If CPU has at least one hit card, only hit cards are legal
+    if (handHasHitCard(m_cpu)) {
+        for (int i = 0; i < m_cpu.size(); ++i) {
+            if (isHitRank(m_cpu[i].rank))
+                legal.append(i);
+        }
+        return legal;
+    }
+
+    // Otherwise, any card can be thrown
+    for (int i = 0; i < m_cpu.size(); ++i)
+        legal.append(i);
+
+    return legal;
+}
+
+int GameEngine::scoreCpuMove(int handIndex, bool stronger) const
+{
+    if (handIndex < 0 || handIndex >= m_cpu.size())
+        return -1000000;
+
+    const Card& c = m_cpu[handIndex];
+    const bool openingLead = (m_movesInPile == 0);
+    const bool hit = (!openingLead && isHitRank(c.rank));
+    const bool seven = (c.rank == 7);
+    const bool zsir = c.isZsir();
+
+    int score = 0;
+
+    if (openingLead) {
+        // Do not lead with valuable cards unless needed
+        if (seven) score -= (stronger ? 30 : 18);
+        if (zsir)  score -= (stronger ? 22 : 10);
+
+        // Prefer low / disposable cards as openers
+        score += (15 - c.rank);
+
+        // Small bonus if we keep duplicate ranks in hand
+        int sameRank = 0;
+        for (const Card& other : m_cpu)
+            if (other.rank == c.rank) ++sameRank;
+        if (sameRank >= 2) score += 8;
+    } else {
+        if (hit) score += 100;
+
+        // Prefer natural hit over spending a 7
+        if (c.rank == m_cardToHit) score += 25;
+        if (seven) score -= (stronger ? 20 : 10);
+
+        // Capturing zsírs is valuable
+        int pileZsir = 0;
+        for (const Card& t : m_table)
+            if (t.isZsir()) pileZsir += 10;
+        if (hit) score += pileZsir * (stronger ? 4 : 3);
+
+        // Avoid throwing valuable cards into opponent's likely capture
+        if (!hit && zsir) score -= (stronger ? 35 : 20);
+    }
+
+    return score;
+}
+
+int GameEngine::chooseCpuIndexEasy(const QVector<int>& legal) const
+{
+    if (legal.isEmpty())
+        return -1;
+
+    // Easy: random legal move, with only a soft bias toward actual hits
+    QVector<int> bag = legal;
+    for (int idx : legal) {
+        if (m_movesInPile > 0 && isHitRank(m_cpu[idx].rank))
+            bag.append(idx);
+    }
+
+    std::uniform_int_distribution<int> dist(0, bag.size() - 1);
+    return bag[dist(rng)];
+}
+
+int GameEngine::chooseCpuIndexNormal(const QVector<int>& legal, bool stronger) const
+{
+    if (legal.isEmpty())
+        return -1;
+
+    int best = legal.first();
+    int bestScore = scoreCpuMove(best, stronger);
+
+    QVector<int> ties;
+    ties.append(best);
+
+    for (int i = 1; i < legal.size(); ++i) {
+        const int idx = legal[i];
+        const int s = scoreCpuMove(idx, stronger);
+
+        if (s > bestScore) {
+            best = idx;
+            bestScore = s;
+            ties.clear();
+            ties.append(idx);
+        } else if (s == bestScore) {
+            ties.append(idx);
+        }
+    }
+
+    if (ties.size() > 1) {
+        std::uniform_int_distribution<int> dist(0, ties.size() - 1);
+        return ties[dist(rng)];
+    }
+
+    return best;
+}
+
 int GameEngine::chooseCpuIndex() const
 {
-    if (m_cpu.isEmpty()) return -1;
+    if (m_cpu.isEmpty())
+        return -1;
 
-    if (m_movesInPile == 0) return 0;
+    const QVector<int> legal = legalCpuMoves();
+    if (legal.isEmpty())
+        return -1;
 
-    // Prefer a hit if available (rank==cardToHit or 7)
-    for (int i = 0; i < m_cpu.size(); ++i)
-        if (isHitRank(m_cpu[i].rank)) return i;
+    switch (static_cast<AiDifficulty>(m_aiDifficulty)) {
+    case AiDifficulty::Easy:
+        return chooseCpuIndexEasy(legal);
+    case AiDifficulty::Normal:
+        return chooseCpuIndexNormal(legal, false);
+    case AiDifficulty::Hard:
+        return chooseCpuIndexNormal(legal, true);
+    case AiDifficulty::Expert:
+        return chooseCpuIndexNormal(legal, true); // phase 1: same as Hard
+    }
 
-    // Else play any card
-    return 0;
+    return chooseCpuIndexNormal(legal, false);
 }
 
 void GameEngine::updateStatusText()

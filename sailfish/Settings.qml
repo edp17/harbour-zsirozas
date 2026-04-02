@@ -238,6 +238,28 @@ Page {
                             onValueChanged: settings.aiPlayDelay = value
                         }
                     }
+
+                    Column {
+                        width: parent.width - 2 * Theme.paddingLarge
+                        anchors.horizontalCenter: parent.horizontalCenter
+                        spacing: Theme.paddingSmall
+
+                        ComboBox {
+                            width: parent.width
+                            label: qsTr("AI difficulty")
+
+                            currentIndex: settings.aiDifficulty
+
+                            menu: ContextMenu {
+                                MenuItem { text: qsTr("Easy") }
+                                MenuItem { text: qsTr("Normal") }
+                                MenuItem { text: qsTr("Hard") }
+                                MenuItem { text: qsTr("Expert") }
+                            }
+
+                            onCurrentIndexChanged: settings.aiDifficulty = currentIndex
+                        }
+                    }
                 }
             }
 
@@ -290,14 +312,6 @@ Page {
                         text: settings.ai2Name
                         onTextChanged: settings.ai2Name = text
                     }
-
-                    TextField {
-                        width: parent.width - 2 * Theme.paddingLarge
-                        anchors.horizontalCenter: parent.horizontalCenter
-                        label: qsTr("AI 3 name")
-                        text: settings.ai3Name
-                        onTextChanged: settings.ai3Name = text
-                    }
                 }
             }
 
@@ -314,9 +328,9 @@ Page {
                     settings.cardStyle = "Piatnik"
                     settings.tableFlightDuration = 1.0
                     settings.aiPlayDelay = 650
+                    settings.aiDifficulty = 1
                     settings.ai1Name = "AI 1"
                     settings.ai2Name = "AI 2"
-                    settings.ai3Name = "AI 3"
 
                     settings.cardStyleExpanded = true
                     settings.animationsExpanded = false

@@ -13,6 +13,7 @@ ApplicationWindow
 
         // persisted values
         property int aiPlayDelay: 650
+        property int aiDifficulty: 1
         property int tableFlightDuration: 500
         property string cardStyle: "Piatnik"
         property string ai1Name: "AI 1"
@@ -117,6 +118,7 @@ function resetSeen() {
             GameEngine {
                 id: engine
                 aiPlayDelay: appSettings.aiPlayDelay
+                aiDifficulty: appSettings.aiDifficulty
             }
 
             Item {

@@ -26,6 +26,7 @@ class GameEngine : public QObject
     Q_PROPERTY(QVariantList cpuWonCards READ cpuWonCards NOTIFY stateChanged)
 
     Q_PROPERTY(int aiPlayDelay READ aiPlayDelay WRITE setAiPlayDelay NOTIFY aiPlayDelayChanged)
+    Q_PROPERTY(int aiDifficulty READ aiDifficulty WRITE setAiDifficulty NOTIFY aiDifficultyChanged)
 
     // New rule-state properties (0v-style)
     Q_PROPERTY(int cardToHit READ cardToHit NOTIFY stateChanged)
@@ -46,6 +47,9 @@ public:
 
     enum class Winner { Player, Cpu };
     Q_ENUM(Winner)
+
+    enum class AiDifficulty { Easy = 0, Normal = 1, Hard = 2, Expert = 3 };
+    Q_ENUM(AiDifficulty)
 
     struct Card {
         int rank = 0;      // 7..14 (Ace=14)
@@ -80,8 +84,12 @@ public:
     QVariantList playerWonCards() const;
     QVariantList cpuWonCards() const;
 
+    // getter/setter
     int aiPlayDelay() const { return m_aiPlayDelay; }
     void setAiPlayDelay(int ms);
+
+    int aiDifficulty() const { return m_aiDifficulty; }
+    void setAiDifficulty(int difficulty);
 
     int cardToHit() const { return m_cardToHit; }
     bool haveToMove() const { return m_haveToMove; }
@@ -96,6 +104,7 @@ signals:
     void scoreChanged();
     void aiPlayDelayChanged();
     void stateChanged();
+    void aiDifficultyChanged();
 
 private:
     // State machine helpers
@@ -119,6 +128,10 @@ private:
 
     void maybeScheduleCpuMove();
     int  chooseCpuIndex() const;
+    QVector<int> legalCpuMoves() const;
+    int chooseCpuIndexEasy(const QVector<int>& legal) const;
+    int chooseCpuIndexNormal(const QVector<int>& legal, bool stronger) const;
+    int scoreCpuMove(int handIndex, bool stronger) const;
 
     void updateStatusText();
 
@@ -163,6 +176,8 @@ private:
     QTimer m_pileTimer;
     int    m_aiPlayDelay = 1500;
     int    m_pileDelayMs = 400;
+
+    int m_aiDifficulty = static_cast<int>(AiDifficulty::Normal);
 
     // Endgame special rule preserved from your previous code
     bool m_lastPlayedWasSeven = false;
