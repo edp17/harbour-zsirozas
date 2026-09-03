@@ -3,12 +3,22 @@
 #include <QQuickView>
 #include <QtQml>
 #include <QMetaType>
+#include <QLocale>
+#include <QTranslator>
 #include "GameEngine.h"
 
 int main(int argc, char *argv[])
 {
     QGuiApplication *app = SailfishApp::application(argc, argv);
     QQuickView *view = SailfishApp::createView();
+
+    QTranslator translator;
+    const QString translationDirectory = SailfishApp::pathTo(
+        QStringLiteral("translations")).toLocalFile();
+    if (translator.load(QLocale(), QStringLiteral("harbour-zsirozas"),
+                        QStringLiteral("-"), translationDirectory)) {
+        app->installTranslator(&translator);
+    }
 
     // Register C++ type for QML
     qmlRegisterType<GameEngine>(

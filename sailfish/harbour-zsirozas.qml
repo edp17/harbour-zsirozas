@@ -1,666 +1,580 @@
+/*
+    Copyright (C) 2026 edp17 and chatGPT
+
+    This file is part of harbour-zsirozas.
+
+    The harbour-zsirozas is free software: you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+
+    The harbour-zsirozas is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with the harbour-zsirozas. If not, see <http://www.gnu.org/licenses/>.
+*/
 import QtQuick 2.6
 import Sailfish.Silica 1.0
 import harbour.zsir 1.0
 import Nemo.Configuration 1.0
-import QtQuick.Layouts 1.0
 
-ApplicationWindow
-{
-
+ApplicationWindow {
     ConfigurationGroup {
         id: appSettings
         path: "/apps/harbour-zsirozas/settings"
 
-        // persisted values
         property int aiPlayDelay: 650
-        property int aiDifficulty: 1
-        property int tableFlightDuration: 500
+        property int aiDifficulty: 1 // legacy RC3 key
+        property int ai1Difficulty: aiDifficulty
+        property int ai2Difficulty: 2
+        property int ai3Difficulty: 3
+        property bool animationsEnabled: true
+        property real tableFlightDuration: 1.0 // animation speed; legacy name retained
         property string cardStyle: "Piatnik"
+        property string playerName: "Player"
+        property int opponentCount: 1
         property string ai1Name: "AI 1"
         property string ai2Name: "AI 2"
-
-        // persisted UI state
-        property bool cardStyleExpanded: true
-        property bool animationsExpanded: false
-        property bool namesExpanded: false
+        property string ai3Name: "AI 3"
     }
 
-    cover: Component {
-        CoverPage { }
-    }
+    cover: Component { CoverPage { cardStyle: appSettings.cardStyle } }
 
-    initialPage: Component
-    {
+    initialPage: Component {
         Page {
             id: mainPage
-    // Phase0: disable all visual animations; keep layout + game logic
-    property bool animationsEnabled: false
-    property var flyingById: ({})    // cardId -> flying clone object
+            allowedOrientations: Orientation.Portrait
 
-            // Declarations ---------------------------
-            property int lastTableCount: 0
-            property var lastTableSnapshot: ([])
-            property bool initialDeal: true
-            property var seenPlayerIds: ({})
-            property var seenAiIds: ({})
-            property bool freshRound: true   // optional; used to animate first hand nicely
-            property int trickResolveDelay: 700   // Delay before resiolving the trick in ms
-            property string phase: "idle"          // "toTable" | "pause" | "toPile"
-            property bool playerCardLanded: false
-            property bool aiCardLanded: false
-            property bool aiFlyingActive: false
-            property string hideAiStaticId: ""
+            property real pendingPlayerStartX: -1
+            property real pendingPlayerStartY: -1
+            property string hiddenTableId: ""
+            property var hiddenDealIds: ({})
+            property int activeFlights: 0
+            property string activeFlightRole: ""
+            property bool pulleyRestartPending: false
+            property real wonPileEdgeMargin: Theme.paddingSmall
 
-            property string pendingAiCardId: ""
-            property bool dealingPaused: false
-            property bool capturePending: false
-            property var pendingToPile: ({})  // cardId -> {playerWon, startDelay, startX, startY}
-property bool layoutFrozen: (dealingPaused || capturePending || pileFlightsInProgress > 0)
-            property int pileFlightsInProgress: 0
-property var landedFlyingCards: ({})
-property var flyingByCardId: ({})
+            function animationSpeed() {
+                var speed = Number(appSettings.tableFlightDuration)
+                // Old development builds stored milliseconds (normally 500).
+                if (speed > 10)
+                    speed = 500 / speed
+                return Math.max(0.5, Math.min(2.0, speed || 1.0))
+            }
 
-            function destroyFlyingForCard(cardId) {
-                // Robust cleanup: kill any existing flying clones (toTable/toPile) with this cardId.
-                // Also clears bookkeeping maps so later spawns don't "lose" the old instance.
-                try {
-                    for (var i = animationLayer.children.length - 1; i >= 0; --i) {
-                        var ch = animationLayer.children[i]
-                        if (ch && ch.cardId !== undefined && ch.cardId === cardId) {
-                            try { ch.destroy(); } catch(e) {}
-                        }
-                    }
-                } catch(e2) {}
+            function dur(milliseconds) {
+                return Math.max(1, Math.round(milliseconds / animationSpeed()))
+            }
 
-                if (mainPage.flyingByCardId && mainPage.flyingByCardId[cardId]) {
-                    try { mainPage.flyingByCardId[cardId].destroy(); } catch(e3) {}
-                    delete mainPage.flyingByCardId[cardId]
+            function replaceHiddenDeal(cardId, hidden) {
+                var replacement = ({})
+                for (var key in hiddenDealIds) {
+                    if (key !== cardId && hiddenDealIds[key])
+                        replacement[key] = true
                 }
-                if (mainPage.landedFlyingCards && mainPage.landedFlyingCards[cardId]) {
-                    try { mainPage.landedFlyingCards[cardId].destroy(); } catch(e4) {}
-                    delete mainPage.landedFlyingCards[cardId]
+                if (hidden)
+                    replacement[cardId] = true
+                hiddenDealIds = replacement
+            }
+
+            function clearFlights() {
+                for (var index = animationLayer.children.length - 1; index >= 0; --index) {
+                    var child = animationLayer.children[index]
+                    if (child && child.isFlyingCard)
+                        child.destroy()
+                }
+                activeFlights = 0
+                activeFlightRole = ""
+                hiddenTableId = ""
+                hiddenDealIds = ({})
+            }
+
+            function deckCenter() {
+                return deckDealPoint.mapToItem(animationLayer, 0, 0)
+            }
+
+            function participant(player) {
+                return player >= 0 && player < engine.participants.length
+                        ? engine.participants[player] : null
+            }
+
+            function handFor(player) {
+                var value = participant(player)
+                return value ? value.hand : []
+            }
+
+            function wonFor(player) {
+                var value = participant(player)
+                return value ? value.wonCards : []
+            }
+
+            function nameFor(player) {
+                var value = participant(player)
+                return value ? value.name : ""
+            }
+
+            function scoreFor(player) {
+                var value = participant(player)
+                return value ? value.score : 0
+            }
+
+            function playerCardCenter(handIndex, count) {
+                var cardWidth = Theme.itemSizeLarge * 1.4
+                var cardHeight = cardWidth * 1.4
+                var left = handArea.width / 2
+                        - ((count - 1) * cardWidth * 0.3)
+                        + handIndex * (cardWidth * 0.6)
+                return handArea.mapToItem(animationLayer,
+                                          left + cardWidth / 2,
+                                          cardHeight / 2)
+            }
+
+            function aiSeat(player) {
+                if (!engine.teamGame)
+                    return aiTopHandArea
+                if (player === 1)
+                    return aiLeftHandArea
+                if (player === 2)
+                    return aiTopHandArea
+                return aiRightHandArea
+            }
+
+            function aiCardCenter(player, handIndex, count) {
+                var seat = aiSeat(player)
+                var vertical = engine.teamGame && (player === 1 || player === 3)
+                var cardWidth = vertical ? Theme.itemSizeMedium : Theme.itemSizeLarge
+                var cardHeight = cardWidth * 1.4
+                var spacing = vertical ? cardHeight * 0.18 : cardWidth * 0.5
+                var handLength = (count - 1) * spacing + (vertical ? cardHeight : cardWidth)
+                var x = vertical ? seat.width / 2 : (seat.width - handLength) / 2
+                        + handIndex * spacing + cardWidth / 2
+                var y = vertical ? (seat.height - handLength) / 2
+                        + handIndex * spacing + cardHeight / 2 : cardHeight / 2
+                return seat.mapToItem(animationLayer, x, y)
+            }
+
+            function aiCardScale(player) {
+                if (engine.teamGame && (player === 1 || player === 3))
+                    return Theme.itemSizeMedium / (Theme.itemSizeLarge * 1.4)
+                return 1.0 / 1.4
+            }
+
+            function scatterUnit(cardId, tableIndex, salt) {
+                var value = ((tableIndex + 1) * 1103515245 + salt * 12345) >>> 0
+                for (var index = 0; index < cardId.length; ++index)
+                    value = ((value * 33) ^ cardId.charCodeAt(index)) >>> 0
+                return (value % 2001) / 1000.0 - 1.0
+            }
+
+            function tableCardOffsetX(cardId, tableIndex) {
+                return scatterUnit(cardId, tableIndex, 17) * Theme.paddingLarge * 0.72
+            }
+
+            function tableCardOffsetY(cardId, tableIndex) {
+                return scatterUnit(cardId, tableIndex, 31) * Theme.paddingLarge * 0.58
+                        + tableIndex * 1.5
+            }
+
+            function tableCardRotation(cardId, tableIndex) {
+                var direction = scatterUnit(cardId, tableIndex, 43) < 0 ? -1 : 1
+                return direction * (2 + Math.abs(scatterUnit(cardId, tableIndex, 59)) * 12)
+            }
+
+            function tableCardCenter(tableIndex, cardId) {
+                return tableRow.mapToItem(animationLayer,
+                                          tableCardOffsetX(cardId, tableIndex),
+                                          tableCardOffsetY(cardId, tableIndex))
+            }
+
+            function wonPileCenter(winnerPlayer) {
+                var target = winnerPlayer === 0 ? playerWonPile
+                           : winnerPlayer === 1 ? ai1WonPile
+                           : winnerPlayer === 2 ? ai2WonPile : ai3WonPile
+                return target.mapToItem(animationLayer, target.width / 2, target.height / 2)
+            }
+
+            function openWonCards(player) {
+                if (player !== 0)
+                    return
+                var value = participant(player)
+                if (!value)
+                    return
+                pageStack.push(Qt.resolvedUrl("WonCardsPage.qml"), {
+                    ownerName: value.name,
+                    teamLabel: qsTr("Your captured cards"),
+                    cards: value.wonCards,
+                    score: value.score,
+                    cardStyle: appSettings.cardStyle
+                })
+            }
+
+            function spawnFlight(cardId, role, start, target, delay,
+                                 faceUp, flipMode, startScale, endScale) {
+                var cardWidth = Theme.itemSizeLarge * 1.4
+                var cardHeight = cardWidth * 1.4
+                return flyingCardComponent.createObject(animationLayer, {
+                    cardId: cardId,
+                    cardStyle: appSettings.cardStyle,
+                    flightRole: role,
+                    startCenterX: start.x,
+                    startCenterY: start.y,
+                    targetCenterX: target.x,
+                    targetCenterY: target.y,
+                    startDelay: delay,
+                    flightDuration: dur(role === "pile" ? 420 : 360),
+                    faceUp: faceUp,
+                    flipMode: flipMode,
+                    startScale: startScale,
+                    endScale: endScale,
+                    x: start.x - cardWidth / 2,
+                    y: start.y - cardHeight / 2
+                })
+            }
+
+            function startCardFlight(cardId, playedBy, oldHandIndex) {
+                if (!appSettings.animationsEnabled)
+                    return
+
+                activeFlightRole = "table"
+                activeFlights = 1
+                hiddenTableId = cardId
+
+                var start
+                var scale
+                if (playedBy === 0) {
+                    start = pendingPlayerStartX >= 0 && pendingPlayerStartY >= 0
+                            ? Qt.point(pendingPlayerStartX, pendingPlayerStartY)
+                            : playerCardCenter(oldHandIndex, engine.playerHand.length + 1)
+                    scale = 1.0
+                } else {
+                    start = aiCardCenter(playedBy, oldHandIndex,
+                                         handFor(playedBy).length + 1)
+                    scale = aiCardScale(playedBy)
+                }
+                pendingPlayerStartX = -1
+                pendingPlayerStartY = -1
+
+                spawnFlight(cardId,
+                            "table",
+                            start,
+                            tableCardCenter(engine.tableCards.length - 1, cardId),
+                            0,
+                            playedBy === 0,
+                            playedBy !== 0 ? 1 : 0,
+                            scale,
+                            1.0)
+            }
+
+            function startPileFlights(winnerPlayer) {
+                if (!appSettings.animationsEnabled)
+                    return
+
+                if (activeFlights > 0)
+                    clearFlights()
+                activeFlightRole = "pile"
+                activeFlights = engine.tableCards.length
+                hiddenTableId = "*"
+                if (activeFlights === 0) {
+                    engine.completePileAnimation()
+                    return
+                }
+
+                var target = wonPileCenter(winnerPlayer)
+                for (var index = 0; index < engine.tableCards.length; ++index) {
+                    var tableCard = engine.tableCards[index]
+                    spawnFlight(tableCard.id,
+                                "pile",
+                                tableCardCenter(index, tableCard.id),
+                                target,
+                                index * dur(80),
+                                true,
+                                2,
+                                1.0,
+                                0.58)
                 }
             }
-property var tableCardRefs: ({})
-property bool captureGateTimerFired: true
-            property double captureGateStartedAt: 0
-            property bool pendingTrickResolve: false
-            property int dealFirstSide: -1   // 0=player, 1=AI (who draws first after trick)
-property int dealPhaseEndsAtMs: 0
-            property int dealLoserExtraMs: 0  // extra delay applied to the non-winner's dealing
-            property int tableFlightDuration: effDur(appSettings.tableFlightDuration, 250)
-            property bool dealPhaseActive: false   // blocks AI from playing next card until dealing visuals finish
-            property int dealPhaseMs: 0
-            property int pileFlightDuration: tableFlightDuration + 250   // ms
-            property string ai1Name: appSettings.ai1Name
 
-                        function effDur(v, baseMs) {
-                // Backward compatible: older settings may store a small "speed factor" (1..10).
-                // If v is small, treat it as a multiplier; otherwise treat it as milliseconds.
-                if (v === undefined || v === null) return baseMs;
-                if (v <= 0) return baseMs;
-                if (v < 50) return v * baseMs;
-                return v;
+            function startDealFlights(cards) {
+                if (!appSettings.animationsEnabled)
+                    return
+
+                if (activeFlights > 0)
+                    clearFlights()
+                activeFlightRole = "deal"
+                activeFlights = cards.length
+                hiddenDealIds = ({})
+                if (activeFlights === 0) {
+                    engine.completeDealAnimation()
+                    return
+                }
+
+                var start = deckCenter()
+                for (var index = 0; index < cards.length; ++index) {
+                    var dealt = cards[index]
+                    replaceHiddenDeal(dealt.id, true)
+                    var playerCard = dealt.player === 0
+                    var target = playerCard
+                            ? playerCardCenter(dealt.handIndex, engine.playerHand.length)
+                            : aiCardCenter(dealt.player, dealt.handIndex,
+                                           handFor(dealt.player).length)
+                    spawnFlight(dealt.id,
+                                "deal",
+                                start,
+                                target,
+                                dealt.order * dur(110),
+                                false,
+                                playerCard ? 1 : 0,
+                                playerCard ? 0.72 : 1.0,
+                                playerCard ? 1.0 : aiCardScale(dealt.player))
+                }
             }
 
-            function dur(baseMs) {
-                if (!mainPage.animationsEnabled) return 0;
-                // Apply the same animation speed scaling as tableFlightDuration.
-                return effDur(appSettings.tableFlightDuration, baseMs);
+            function flightFinished(role, cardId) {
+                if (role !== activeFlightRole)
+                    return
+
+                if (role === "deal")
+                    replaceHiddenDeal(cardId, false)
+
+                activeFlights = Math.max(0, activeFlights - 1)
+                if (activeFlights !== 0)
+                    return
+
+                activeFlightRole = ""
+                if (role === "table") {
+                    hiddenTableId = ""
+                    engine.completeCardAnimation()
+                } else if (role === "pile") {
+                    hiddenTableId = ""
+                    engine.completePileAnimation()
+                } else if (role === "deal") {
+                    hiddenDealIds = ({})
+                    engine.completeDealAnimation()
+                }
             }
 
-function resetSeen() {
-                seenPlayerIds = ({})
-                seenAiIds = ({})
-                freshRound = true
+            function restartGame() {
+                clearFlights()
+                engine.newGame()
+            }
+
+            function requestRestartFromPulley() {
+                pulleyRestartPending = true
+                pulleyRestartTimer.restart()
+            }
+
+            function tryRestartAfterPulley() {
+                if (!pulleyRestartPending)
+                    return
+
+                // MenuItem.onClicked runs while the SilicaFlickable is still
+                // returning from its pulled-down position.  Wait until both
+                // the pulley and its motion are finished so mapToItem() sees
+                // the normal table geometry before dealing starts.
+                if (pulleyMenu.active || flick.moving || flick.dragging || flick.flicking) {
+                    pulleyRestartTimer.restart()
+                    return
+                }
+
+                pulleyRestartPending = false
+                restartGame()
             }
 
             GameEngine {
                 id: engine
+                playerCount: appSettings.opponentCount === 3 ? 4 : 2
+                playerName: appSettings.playerName
+                ai1Name: appSettings.ai1Name
+                ai2Name: appSettings.ai2Name
+                ai3Name: appSettings.ai3Name
                 aiPlayDelay: appSettings.aiPlayDelay
-                aiDifficulty: appSettings.aiDifficulty
+                ai1Difficulty: appSettings.ai1Difficulty
+                ai2Difficulty: appSettings.ai2Difficulty
+                ai3Difficulty: appSettings.ai3Difficulty
+                animationsEnabled: appSettings.animationsEnabled
+                paused: mainPage.status !== PageStatus.Active
+            }
+
+            Connections {
+                target: engine
+
+                onCardAnimationRequested: {
+                    mainPage.startCardFlight(cardId, playedBy, oldHandIndex)
+                }
+
+                onPileAnimationRequested: {
+                    mainPage.startPileFlights(winnerPlayer)
+                }
+
+                onDealAnimationRequested: {
+                    mainPage.startDealFlights(dealtCards)
+                }
+
+                onVisualPhaseChanged: {
+                    if (engine.visualPhase === 0 && mainPage.activeFlights > 0)
+                        mainPage.clearFlights()
+                }
+            }
+
+            Timer {
+                interval: 0
+                running: true
+                repeat: false
+                onTriggered: engine.start()
+            }
+
+            Timer {
+                id: pulleyRestartTimer
+                interval: 50
+                repeat: false
+                onTriggered: mainPage.tryRestartAfterPulley()
             }
 
             Item {
                 id: animationLayer
                 anchors.fill: parent
-                z: 10
+                z: 1000
             }
 
-            Component.onCompleted: {
-                // Run twice: first callLater is often still before anchors settle,
-                // second callLater runs after the next polish pass.
-                updateAllDealOriginsTimer.restart()
-            }
-
-            Timer {
-                id: updateAllDealOriginsTimer
-                interval: 0
-                repeat: false
-                onTriggered: {
-                    updateAllDealOrigins()
-                    updateAllDealOriginsTimer2.restart()
-                }
-            }
-
-            Timer {
-                id: updateAllDealOriginsTimer2
-                interval: 0
-                repeat: false
-                onTriggered: updateAllDealOrigins()
-            }
-
-            // Prevent "vibration": delay hand deal animations right after pile capture flights
-            Timer {
-                id: dealResumeTimer
-                interval: 250
-                repeat: false
-                onTriggered: {
-                    mainPage.captureGateTimerFired = true
-                    mainPage.tryResumeDealing("timer")
-                }
-            }
-
-            Timer {
-                id: dealPhaseTimer
-                interval: 100
-                repeat: true
-                running: true
-                onTriggered: {
-                    if (mainPage.dealPhaseActive && Date.now() >= mainPage.dealPhaseEndsAtMs) {
-                        mainPage.dealPhaseActive = false
-                        if (mainPage.aiSpawnDeferred && mainPage.pendingAiCardId >= 0) {
-                            mainPage.aiSpawnDeferred = false
-                            aiSpawnTimer.restart()
-                        }
-                    }
-                }
-            }
-
-            Timer {
-                id: aiSpawnTimer
-                interval: 0
-                repeat: false
-                onTriggered: {
-                    if (!mainPage.animationsEnabled) {
-                        // No flying animation: keep the static delegate visible; just consume the pending flag.
-                        mainPage.aiFlyingActive = false
-                        mainPage.hideAiStaticId = ""
-                        mainPage.pendingAiCardId = ""
-                        return
-                    }
-                    if (!mainPage.pendingAiCardId) return
-                    spawnAIFlyingCard(mainPage.pendingAiCardId)
-                    mainPage.pendingAiCardId = ""
-                }
-            }
-
-            // Helper functions ---------------------------
-            function updateAllDealOrigins() {
-                if (handArea) handArea.updateDealOrigin()
-                if (aiHandArea) aiHandArea.updateDealOrigin()
-            }
-
-            function playerWonCurrentTrick() {
-                // Determine winner from the full table according to the engine rule:
-                // cardToHit = first card rank; any card with (rank==cardToHit || rank==7) is a hit.
-                // Winner is the player who played the LAST hit in the pile.
-                if (engine.tableCards.length < 2)
-                    return true  // fallback (should not happen in a valid pile)
-
-                var cardToHit = engine.tableCards[0].rank
-                var lastHitterPlayedBy = engine.tableCards[0].playedBy
-
-                for (var i = 1; i < engine.tableCards.length; ++i) {
-                    var c = engine.tableCards[i]
-                    if (c.rank === cardToHit || c.rank === 7)
-                        lastHitterPlayedBy = c.playedBy
-                }
-
-                return lastHitterPlayedBy === 0
-            }
-
-
-            function spawnFlyingCard(cardId, startPoint) {
-                if (!mainPage.animationsEnabled) return;
-                if (!cardId) return;
-                if (!startPoint) startPoint = Qt.point(0, 0);
-                // Destroy any previous clone for this cardId (defensive).
-                if (mainPage.flyingById && mainPage.flyingById[cardId]) {
-                    try { mainPage.flyingById[cardId].destroy(); } catch (e) {}
-                    mainPage.flyingById[cardId] = null
-                }
-                var obj = flyingCardComponent.createObject(animationLayer, {
-                                                            cardId: cardId,
-                                                            flightRole: "playerToTable",
-                                                            x: startPoint.x,
-                                                            y: startPoint.y,
-                                                            opacity: 1,
-                                                            visible: true
-                                                        })
-                if (!mainPage.flyingById) mainPage.flyingById = ({})
-                mainPage.flyingById[cardId] = obj
-            }
-
-            function spawnAIFlyingCard(cardId) {
-                if (!mainPage.animationsEnabled) return;
-                if (!cardId) return;
-                // Hide the static table delegate for this AI card while the flying clone is active.
-                mainPage.aiFlyingActive = true
-                mainPage.hideAiStaticId = cardId
-                var obj = flyingCardComponent.createObject(animationLayer, {
-                                                            cardId: cardId,
-                                                            flightRole: "aiToTable",
-                                                            x: aiHandArea.x + aiHandArea.width/2,
-                                                            y: aiHandArea.y + aiHandArea.height/2,
-                                                            opacity: 1,
-                                                            visible: true
-                                                        })
-                if (!mainPage.flyingById) mainPage.flyingById = ({})
-                mainPage.flyingById[cardId] = obj
-            }
-
-            
-function scheduleDealResumeAfterCapture(nCards) {
-    // Ensure dealing resumes only AFTER capture flights are expected to finish.
-    // nCards: number of cards flying from table to winner pile.
-    if (nCards === undefined || nCards === null) nCards = 0;
-
-    // Capture flight uses pileFlightDuration with per-card stagger of 80ms.
-function tryResumeDealing(reason) {
-    // Resume dealing only when BOTH: capture flights are done AND our time gate has elapsed.
-    if (mainPage.pileFlightsInProgress === 0 && mainPage.captureGateTimerFired) {
-        mainPage.dealingPaused = false
-        mainPage.capturePending = false
-
-        // Block AI from starting the next trick until the full visual deal phase is expected to be done.
-        if (mainPage.dealPhaseMs > 0) {
-            mainPage.dealPhaseActive = true
-            dealPhaseTimer.interval = mainPage.dealPhaseMs
-            dealPhaseTimer.restart()
-        }
-    }
-}
-    dealResumeTimer.restart();
-}
-
-
-function tryResumeDealing(reason) {
-    // Resume dealing only when BOTH: capture flights are done AND our time gate has elapsed.
-    if (mainPage.pileFlightsInProgress === 0 && mainPage.captureGateTimerFired) {
-        mainPage.dealingPaused = false
-        mainPage.capturePending = false
-    }
-}
-
-
-            function _spawnToPileNow(cardId, playerWon, startDelay, startX, startY) {
-                // remove any landed to-table clone for this cardId (prevents overlay staying on top)
-                if (mainPage.landedFlyingCards[cardId]) {
-                    try { mainPage.landedFlyingCards[cardId].destroy(); } catch(e) {}
-                    delete mainPage.landedFlyingCards[cardId]
-                }
-                // if a previous toPile clone exists for same cardId, destroy it (shouldn't happen, but safe)
-                if (mainPage.flyingByCardId[cardId] && mainPage.flyingByCardId[cardId].flightRole === "toPile") {
-                    try { mainPage.flyingByCardId[cardId].destroy(); } catch(e) {}
-                    delete mainPage.flyingByCardId[cardId]
-                }
-
-                var target = playerWon ? playerWonDealPoint : aiWonDealPoint
-                var f = flyingCardComponent.createObject(animationLayer, {
-                    cardId: cardId,
-                    faceUp: true,
-                    wonByPlayer: playerWon,
-                    shouldFlipMidFlight: true,
-                    flightRole: "toPile",
-                    flightDuration: pileFlightDuration,
-                    startDelay: startDelay,
-                    startScale: 1.0,
-                    endScale: 0.5,
-                    x: startX,
-                    y: startY,
-                    z: 900
-                })
-                mainPage.flyingByCardId[cardId] = f
-                f.flyToPoint(target)
-            }
-
-            function _requestToPile(cardId, playerWon, startDelay, startX, startY) {
-                var active = mainPage.flyingByCardId[cardId]
-                if (active && (active.flightRole === "playerToTable" || active.flightRole === "aiToTable")) {
-                    // card is still flying to table; wait until it lands, then spawn toPile
-                    mainPage.pendingToPile[cardId] = {
-                        playerWon: playerWon,
-                        startDelay: startDelay,
-                        startX: startX,
-                        startY: startY
-                    }
-                    return
-                }
-                mainPage._spawnToPileNow(cardId, playerWon, startDelay, startX, startY)
-            }
-
-function animateTableCardsToWinner() {
-        // Snapshot current table cards (engine.tableCards changes during capture)
-        var snapshot = []
-        for (var i = 0; i < engine.tableCards.length; i++) snapshot.push(engine.tableCards[i])
-        animateTableCardsToWinnerFrom(snapshot)
-    }
-
-    function animateTableCardsToWinnerFrom(cards) {
-                if (!cards || cards.length < 2)
-                    return
-                mainPage.dealingPaused = true
-                mainPage.capturePending = true
-                mainPage.pileFlightsInProgress = cards.length
-
-                scheduleDealResumeAfterCapture(cards.length); // Winner = last hitter in this pile (same logic as playerWonCurrentTrick but using snapshot)
-                var cardToHit = cards[0].rank
-                var lastHitterPlayedBy = cards[0].playedBy
-                for (var i = 1; i < cards.length; ++i) {
-                    var cc = cards[i]
-                    if (cc.rank === cardToHit || cc.rank === 7)
-                        lastHitterPlayedBy = cc.playedBy
-                }
-                var playerWon = (lastHitterPlayedBy === 0)
-                // Dealing order: trick winner draws first (visual only)
-                mainPage.dealFirstSide = playerWon ? 0 : 1
-                // Block the other side long enough for up to 3 winner cards to finish animating
-                mainPage.dealLoserExtraMs = (2 * dur(220)) + dur(340)
-                mainPage.dealPhaseMs = mainPage.dealLoserExtraMs + (3 * dur(440)) + dur(320) + dur(200)
-                var target = playerWon ? playerWonDealPoint : aiWonDealPoint
-
-                for (var j = 0; j < cards.length; ++j) {
-                    var card = cards[j]
-                    var start = tableDealPoint.mapToItem(animationLayer,
-                        (j === 0 ? -Theme.paddingLarge : Theme.paddingLarge),
-                        -Theme.paddingMedium)
-
-                    mainPage._requestToPile(card.id, playerWon, j * dur(120), start.x, start.y)
-                }
-}
             Component {
                 id: flyingCardComponent
 
                 Card {
                     id: flyingCard
-                    faceUp: false
-                    z: 1000
-                    opacity: 1.0
-
-                    property bool wonByPlayer: false
-                    property real startScale: 1.0
-                    property real endScale: 1.0   // match the pile card scale
-                    scale: startScale
-                    property bool shouldFlipMidFlight: false
-                    property int flightDuration: 500   // must match x/y animation duration
+                    property bool isFlyingCard: true
+                    property string flightRole: ""
+                    property real startCenterX: 0
+                    property real startCenterY: 0
+                    property real targetCenterX: 0
+                    property real targetCenterY: 0
                     property int startDelay: 0
-                    property bool flipToFaceUpOnTable: false
-                    property string flightRole: ""   // "playerToTable" | "aiToTable" | "toPile"
+                    property int flightDuration: 360
+                    property int flipMode: 0 // 0 none, 1 face up, 2 face down
+                    property real startScale: 1.0
+                    property real endScale: 1.0
+                    property real flipX: 1.0
 
-// Debug & show flying cards
-//                    console.warn("AI FLY SPAWN", cardId)
-//                    Rectangle {
-//                        anchors.fill: parent
-//                        color: "yellow"
-//                        opacity: 0.25
-//                        z: 1
-//                    }
+                    x: startCenterX - width / 2
+                    y: startCenterY - height / 2
+                    scale: startScale
+                    z: 1000
 
                     transform: Scale {
-                        id: flipScale
                         origin.x: flyingCard.width / 2
                         origin.y: flyingCard.height / 2
                         xScale: flyingCard.flipX
-                        yScale: 1
+                        yScale: 1.0
                     }
 
-                    // Avoid RotationY 90° edge-on vanishing on Sailfish: use xScale "flip"
-                    property real flipX: 1.0
+                    Component.onCompleted: flight.start()
 
                     Timer {
-                        id: startDelayTimer
-                        interval: flyingCard.startDelay
+                        id: flipTimer
+                        interval: flyingCard.startDelay + flyingCard.flightDuration / 2 - 80
                         repeat: false
-                        onTriggered: {
-                            flyAnim.start()
-                            // Start flip after flight starts if requested
-                            if (flyingCard.flipToFaceUpOnTable) {
-                                midFlipTimer.start()
-                            } else if (flyingCard.wonByPlayer && flyingCard.shouldFlipMidFlight) {
-                                midFlipTimer.start()
-                            }
-                        }
+                        running: flyingCard.flipMode !== 0
+                        onTriggered: flip.start()
                     }
 
-                    function startFlight() {
-                        if (flyingCard.startDelay > 0) {
-                            startDelayTimer.restart()
-                        } else {
-                            flyAnim.start()
-                            if (flyingCard.flipToFaceUpOnTable) {
-                                midFlipTimer.start()
-                            } else if (flyingCard.wonByPlayer && flyingCard.shouldFlipMidFlight) {
-                                midFlipTimer.start()
-                            }
-                        }
-                    }
-
-                    function flyToTable() {
-                        // flip handled in startFlight()
-var target = tableDealPoint.mapToItem(animationLayer, 0, 0)
-
-                        xAnim.to = target.x
-                        yAnim.to = target.y
-                        startFlight()
-
-                    }
-
-                    function flyToPoint(targetItem) {
-                        var target = targetItem.mapToItem(animationLayer, 0, 0)
-                        xAnim.to = target.x
-                        yAnim.to = target.y
-                        startFlight()
-}
-
-                    Timer {
-                        id: midFlipTimer
-                        interval: Math.floor(flightDuration * 0.85)
-                        repeat: false
-                        onTriggered: {
-                            if (flipToFaceUpOnTable) flipUpAnim.start()
-                            else flipAnim.start() // flip-to-face-down for pile
-                        }
-                    }
-                    ParallelAnimation {
-                        id: flyAnim
-
-                        PropertyAnimation {
-                            id: xAnim
-                            target: flyingCard
-                            property: "x"
-                            duration: flyingCard.flightDuration
-                            easing.type: Easing.OutCubic
-                        }
-
-                        PropertyAnimation {
-                            id: yAnim
-                            target: flyingCard
-                            property: "y"
-                            duration: flyingCard.flightDuration
-                            easing.type: Easing.OutCubic
-                        }
-
+                    SequentialAnimation {
+                        id: flip
                         PropertyAnimation {
                             target: flyingCard
-                            property: "scale"
-                            to: flyingCard.endScale
-                            duration: flyingCard.flightDuration
-                            easing.type: Easing.OutCubic
+                            property: "flipX"
+                            to: 0.08
+                            duration: 80
+                            easing.type: Easing.InQuad
                         }
+                        ScriptAction {
+                            script: flyingCard.faceUp = flyingCard.flipMode === 1
+                        }
+                        PropertyAnimation {
+                            target: flyingCard
+                            property: "flipX"
+                            to: 1.0
+                            duration: 80
+                            easing.type: Easing.OutQuad
+                        }
+                    }
 
-                        onStopped: {
-                            // 1) Landing on table
-                            if (flyingCard.flightRole === "playerToTable") {
-                                mainPage.playerCardLanded = true
-                            } else if (flyingCard.flightRole === "aiToTable") {
-                                mainPage.aiCardLanded = true
-                                mainPage.aiFlyingActive = false
-                               mainPage.hideAiStaticId = ""
+                    SequentialAnimation {
+                        id: flight
+                        PauseAnimation { duration: flyingCard.startDelay }
+                        ParallelAnimation {
+                            NumberAnimation {
+                                target: flyingCard
+                                property: "x"
+                                from: flyingCard.startCenterX - flyingCard.width / 2
+                                to: flyingCard.targetCenterX - flyingCard.width / 2
+                                duration: flyingCard.flightDuration
+                                easing.type: Easing.InOutCubic
                             }
-                            // When BOTH landed: show real table cards and start the pause timer
-                            if (mainPage.phase === "toTable" &&
-                                mainPage.playerCardLanded &&
-                                mainPage.aiCardLanded &&
-                                mainPage.pendingTrickResolve) {
-
-                                // Gate dealing as soon as the trick is complete (both cards landed).
-                                // The engine may already update hands before the capture animation starts.
-                                mainPage.dealingPaused = true
-                                mainPage.capturePending = true
-                                mainPage.phase = "pause"
-                                mainPage.pendingTrickResolve = false
-                                exitTimer.restart()
-                                resolveTrickTimer.restart()   // this is your trickResolveDelay pause
+                            NumberAnimation {
+                                target: flyingCard
+                                property: "y"
+                                from: flyingCard.startCenterY - flyingCard.height / 2
+                                to: flyingCard.targetCenterY - flyingCard.height / 2
+                                duration: flyingCard.flightDuration
+                                easing.type: Easing.InOutCubic
                             }
-
-                            // 2) Flying to winner pile
-                            if (flyingCard.flightRole === "toPile") {
-                                mainPage.pileFlightsInProgress--
-                                if (mainPage.pileFlightsInProgress === 0) {
-                                    mainPage.phase = "idle"
-                                }
-                                mainPage.tryResumeDealing("flight")
+                            NumberAnimation {
+                                target: flyingCard
+                                property: "scale"
+                                to: flyingCard.endScale
+                                duration: flyingCard.flightDuration
+                                easing.type: Easing.InOutCubic
                             }
-                            // Keep landed to-table flying cards alive until resolveTrickTimer starts (prevents blink gap)
-                            if (flyingCard.flightRole === "playerToTable" || flyingCard.flightRole === "aiToTable") {
-                                // If the static table delegate already exists (AI often creates it before the flight finishes),
-                                // destroy the flying clone immediately after landing. Otherwise keep it until the delegate arrives.
-                                var tc = mainPage.tableCardRefs[flyingCard.cardId]
-                                if (tc) {
-                                    tc.visible = true
-                                    tc.opacity = 1
-                                    flyingCard.destroy(1)
-                                } else {
-                                    mainPage.landedFlyingCards[flyingCard.cardId] = flyingCard
-                                }
-                            } else {
+                        }
+                        ScriptAction {
+                            script: {
+                                mainPage.flightFinished(flyingCard.flightRole, flyingCard.cardId)
                                 flyingCard.destroy()
                             }
-                        }
-
-                    }
-
-                    SequentialAnimation {
-                        id: flipAnim
-
-                        PropertyAnimation {
-                            target: flyingCard
-                            property: "flipX"
-                            from: 1.0
-                            to: 0.30
-                            duration: 80
-                            easing.type: Easing.InQuad
-                        }
-
-                        ScriptAction { script: flyingCard.faceUp = false }
-
-                        PropertyAnimation {
-                            target: flyingCard
-                            property: "flipX"
-                            from: 0.30
-                            to: 1.0
-                            duration: 80
-                            easing.type: Easing.OutQuad
-                        }
-                    }
-
-                    SequentialAnimation {
-                        id: flipUpAnim
-
-                        PropertyAnimation {
-                            target: flyingCard
-                            property: "flipX"
-                            from: 1.0
-                            to: 0.30
-                            duration: 80
-                            easing.type: Easing.InQuad
-                        }
-
-                        ScriptAction { script: flyingCard.faceUp = true }
-
-                        PropertyAnimation {
-                            target: flyingCard
-                            property: "flipX"
-                            from: 0.30
-                            to: 1.0
-                            duration: 80
-                            easing.type: Easing.OutQuad
                         }
                     }
                 }
             }
-            
-            // VISUAL / SCROLLABLE CONTENT ---------------------------
+
             SilicaFlickable {
                 id: flick
                 anchors.fill: parent
                 contentHeight: height
-                
-                // Pulley menu ---------------------------
+                onMovementEnded: mainPage.tryRestartAfterPulley()
+
                 PullDownMenu {
-                    MenuItem {
-                        text: "New Game"
-                        onClicked: {
-                            mainPage.resetSeen()
-                            engine.newGame()
-                        }
+                    id: pulleyMenu
+                    onActiveChanged: {
+                        if (!active && mainPage.pulleyRestartPending)
+                            pulleyRestartTimer.restart()
                     }
 
+                    MenuItem { text: qsTr("New Game"); onClicked: mainPage.requestRestartFromPulley() }
+                    MenuItem { text: qsTr("Settings"); onClicked: pageStack.push(Qt.resolvedUrl("Settings.qml"), { settings: appSettings }) }
                     MenuItem {
-                        text: "Restart Round"
-                        onClicked: {
-                            mainPage.resetSeen()
-                            engine.newGame()   // or engine.restartRound() later
-                        }
+                        text: qsTr("Game Rules")
+                        onClicked: pageStack.push(Qt.resolvedUrl("GameRules.qml"),
+                                                  { cardStyle: appSettings.cardStyle })
                     }
-
-                    MenuItem {
-                        text: "Settings"
-                        onClicked: {
-                            pageStack.push(Qt.resolvedUrl("Settings.qml"), { settings: appSettings })
-                        }
-                    }
-
-                    MenuItem {
-                        text: "Game Rules"
-                        onClicked: pageStack.push(Qt.resolvedUrl("GameRules.qml"))
-                    }
-
-                    MenuItem {
-                        text: "About"
-                        onClicked: pageStack.push(Qt.resolvedUrl("AboutPage.qml"))
-                    }
+                    MenuItem { text: qsTr("About"); onClicked: pageStack.push(Qt.resolvedUrl("AboutPage.qml")) }
                 }
-                
-                // Table background ---------------------------        
+
                 Item {
                     id: gameRoot
                     width: flick.width
                     height: flick.height
 
-                    // Table background ---------------------------
                     Rectangle {
                         id: tableBackground
-                        anchors {
-                            top: parent.top
-                            left: parent.left
-                            right: parent.right
-                            bottom: handArea.top
-                        }
-//                        color: "#1b5e20"   // dark green felt
+                        anchors.top: parent.top
+                        anchors.left: parent.left
+                        anchors.right: parent.right
+                        anchors.bottom: handArea.top
+
                         Rectangle {
-                            anchors.fill: tableBackground
+                            anchors.fill: parent
                             color: "transparent"
                             border.color: "#0f3d13"
                             border.width: 1
@@ -672,542 +586,186 @@ var target = tableDealPoint.mapToItem(animationLayer, 0, 0)
                             GradientStop { position: 1.0; color: "#144a18" }
                         }
                     }
-//------------------------------------------------------------------------------------
-//-            SilicaFlickable {
-//-                anchors.fill: parent
-//-                contentHeight: height
 
-//---PullDownMenu
-//---statusLabel
-//---lastTrickLabel
-//---scoreRow
-//---roundResultLabel
-
-//-                Button {
-//-                    text: "New Game"
-//-                    anchors.horizontalCenter: parent.horizontalCenter
-//-                    anchors.top: roundResultLabel.bottom
-//-                    anchors.topMargin: Theme.paddingLarge
-//-                    highlighted: true
-//-                    visible: engine.roundResult.length > 0
-//-                    onClicked: engine.newGame()
-//-                }
-//-            }
-//------------------------------------------------------------------------------------
-                    // AI won pile target
-                    Item {
-                        id: aiWonDealPoint
-                        width: 1
-                        height: 1
-                        anchors.left: aiWonPile.left
-                        anchors.top: aiWonPile.top
-// Debug Visual AI pile
-//                        Rectangle {
-//                            width: aiWonPile.width
-//                            height: aiWonPile.height
-//                            color: "red"
-//                        }
-                    }
-
-                    // Player won pile target
-                    Item {
-                        id: playerWonDealPoint
-                        width: 1
-                        height: 1
-                        anchors.left: playerWonPile.left
-                        anchors.top: playerWonPile.top
-// Debug Visual player pile
-//                        Rectangle {
-//                            width: 100
-//                            height: 100
-//                            color: "red"
-//                        }
-                    }
-
-                    /* =========================
-                       WON CARDS – AI
-                       ========================= */
-                    Item {
-                        id: aiWonPile
-                        anchors.top: aiHandArea.bottom
-                        anchors.left: aiHandArea.left
-                        anchors.topMargin: Theme.paddingMedium
-                        width: Theme.itemSizeLarge
-                        height: Theme.itemSizeLarge * 1.4
-                        z: 0.5
-
-                        Label {
-                            id: aiZsirLabel
-                            text: engine.cpuScore
-                            visible: Number(engine.cpuScore) > 0
-                            anchors.horizontalCenter: parent.horizontalCenter
-                            y: -height - Theme.paddingSmall
-                            font.pixelSize: Theme.fontSizeSmall
-                        }
-
-                        // AI won card pile area
-                        Rectangle {
-                            anchors.fill: parent
-                            radius: Theme.paddingSmall
-                            color: "#2979ff"
-                            opacity: 0.06
-                            z: -2
-                        }
-
-                        Repeater {
-                            model: engine.cpuWonCards
-
-                            delegate: Card {
-                                cardId: modelData.id
-                                faceUp: false
-                                width: Theme.itemSizeLarge * 0.8
-                                height: Theme.itemSizeLarge * 1.12
-                                x: index * 2
-                                y: index * 2
-                                z: index
-                                scale: 0.9
-                                rotation: (index % 2 === 0 ? 2 : -2) * Math.min(index, 3)
-                                transformOrigin: Item.Center
-                                opacity: index >= model.count - 3 ? 1.0 : 0.6
-
-                                Behavior on x { NumberAnimation { duration: 200 } }
-                                Behavior on y { NumberAnimation { duration: 200 } }
-                                Behavior on rotation { NumberAnimation { duration: 200 } }
-                            }
-                        }
-                    }
-
-                    /* =========================
-                       AI HAND AREA (top)
-                       ========================= */
-                    Item {
-                        id: aiHandArea
+                    AiHand {
+                        id: aiTopHandArea
                         anchors.left: parent.left
                         anchors.right: parent.right
                         anchors.top: parent.top
                         anchors.topMargin: Theme.itemSizeLarge * 1.2
                         height: Theme.itemSizeLarge * 1.5
                         z: 1
+                        playerName: mainPage.nameFor(engine.teamGame ? 2 : 1)
+                        cards: mainPage.handFor(engine.teamGame ? 2 : 1)
+                        cardStyle: appSettings.cardStyle
+                        hiddenCardIds: mainPage.hiddenDealIds
+                        activeTurn: engine.turnPlayer === (engine.teamGame ? 2 : 1)
+                    }
 
-                        // AI deal origin
-                        property point dealOrigin: Qt.point(0, 0)
+                    AiHand {
+                        id: aiLeftHandArea
+                        visible: engine.teamGame
+                        anchors.left: parent.left
+                        anchors.leftMargin: Theme.paddingSmall
+                        anchors.verticalCenter: parent.verticalCenter
+                        anchors.verticalCenterOffset: -Theme.itemSizeLarge * 0.3
+                        width: Theme.itemSizeLarge
+                        height: Theme.itemSizeLarge * 3.0
+                        vertical: true
+                        playerName: mainPage.nameFor(1)
+                        cards: mainPage.handFor(1)
+                        cardStyle: appSettings.cardStyle
+                        hiddenCardIds: mainPage.hiddenDealIds
+                        activeTurn: engine.turnPlayer === 1
+                        z: 1
+                    }
 
-                        function updateDealOrigin() {
-                            var p = deckDealPoint.mapToItem(aiHandArea, 0, 0)
-                            dealOrigin = Qt.point(p.x, p.y)
-                        }
+                    AiHand {
+                        id: aiRightHandArea
+                        visible: engine.teamGame
+                        anchors.right: parent.right
+                        anchors.rightMargin: Theme.paddingSmall
+                        anchors.verticalCenter: parent.verticalCenter
+                        anchors.verticalCenterOffset: -Theme.itemSizeLarge * 0.3
+                        width: Theme.itemSizeLarge
+                        height: Theme.itemSizeLarge * 3.0
+                        vertical: true
+                        playerName: mainPage.nameFor(3)
+                        cards: mainPage.handFor(3)
+                        cardStyle: appSettings.cardStyle
+                        hiddenCardIds: mainPage.hiddenDealIds
+                        activeTurn: engine.turnPlayer === 3
+                        z: 1
+                    }
 
-                        Component.onCompleted: {
-                            // let anchors settle first
-                            updateDealOriginTimerAI.restart()
-                        }
+                    WonPile {
+                        id: ai1WonPile
+                        anchors.top: engine.teamGame ? aiLeftHandArea.bottom : aiTopHandArea.bottom
+                        anchors.left: parent.left
+                        anchors.topMargin: Theme.paddingMedium
+                        anchors.leftMargin: engine.teamGame
+                                            ? mainPage.wonPileEdgeMargin
+                                            : Theme.paddingLarge
+                        width: Theme.itemSizeMedium
+                        height: width * 1.4
+                        z: 0.5
+                        playerName: mainPage.nameFor(1)
+                        cards: mainPage.wonFor(1)
+                        score: mainPage.scoreFor(1)
+                        cardStyle: appSettings.cardStyle
+                        accentColor: "#ffb74d"
+                    }
 
-                        Timer {
-                            id: updateDealOriginTimerAI
-                            interval: 0
-                            repeat: false
-                            onTriggered: aiHandArea.updateDealOrigin()
-                        }
-                        Connections {
-                            target: deckArea
-                            onXChanged: aiHandArea.updateDealOrigin()
-                            onYChanged: aiHandArea.updateDealOrigin()
-                            onWidthChanged: aiHandArea.updateDealOrigin()
-                            onHeightChanged: aiHandArea.updateDealOrigin()
-                        }
+                    WonPile {
+                        id: ai2WonPile
+                        visible: engine.teamGame
+                        anchors.top: aiTopHandArea.bottom
+                        anchors.left: ai1WonPile.left
+                        anchors.topMargin: Theme.paddingMedium
+                        width: Theme.itemSizeMedium
+                        height: width * 1.4
+                        z: 0.5
+                        playerName: mainPage.nameFor(2)
+                        cards: mainPage.wonFor(2)
+                        score: mainPage.scoreFor(2)
+                        cardStyle: appSettings.cardStyle
+                        accentColor: "#66bb6a"
+                    }
 
-                        Repeater {
-                            model: engine.cpuHand
-
-                            delegate: Card {
-                                id: aiCard
-                                cardId: modelData.id
-                                faceUp: false
-
-                                // Small AI card size - match with deck size
-                                width: Theme.itemSizeLarge
-                                height: Theme.itemSizeLarge * 1.4
-
-                                property int count: engine.cpuHand.length
-                                property real spacing: width * 0.5
-                                property real handWidth: (count - 1) * spacing + width
-
-                                // Must NOT be a binding (it can flip mid-flow when seenAiIds updates).
-                                // We compute it once per delegate in Component.onCompleted.
-                                property bool bornAtDeck: false
-                                property int dealDelay: (index * dur(220)) + ((bornAtDeck && mainPage.dealFirstSide === 0) ? mainPage.dealLoserExtraMs : 0)  // AI delays when PLAYER draws first
-                                property real finalX: (aiHandArea.width - handWidth) / 2 + index * spacing
-                                property real finalY: 0
-
-                                property real dealOffsetX: 0
-                                property real dealOffsetY: 0
-
-                                x: finalX + dealOffsetX
-                                y: finalY + dealOffsetY
-
-                                opacity: 0.9
-
-                                Behavior on x {
-                                    NumberAnimation { duration: (mainPage.layoutFrozen ? 0 : dur(200)); easing.type: Easing.OutCubic }
-                                }
-
-                                Behavior on y {
-                                    NumberAnimation { duration: (mainPage.layoutFrozen ? 0 : dur(240)); easing.type: Easing.OutCubic }
-                                }
-
-                                function startDealIfNeeded() {
-                                    if (mainPage.seenAiIds[modelData.id]) {
-                                        aiCard.opacity = 1.0
-                                        return
-                                    }
-
-                                    if (bornAtDeck) {
-                                        if (mainPage.dealingPaused || mainPage.capturePending || mainPage.pileFlightsInProgress > 0) {
-                                            aiCard.opacity = 0
-                                            waitDealTimer.start()
-                                            return
-                                        }
-                                        mainPage.seenAiIds[modelData.id] = true
-                                        aiCard.opacity = 0
-                                        deferDealStartTimer.restart()
-                                    } else {
-                                        mainPage.seenAiIds[modelData.id] = true
-                                        aiCard.opacity = 1.0
-                                    }
-                                }
-
-                                Component.onCompleted: {
-                                     // Decide once per delegate if this card should animate from deck.
-                                     bornAtDeck = mainPage.freshRound || (!mainPage.seenAiIds[modelData.id])
-                                     // Prevent flicker: keep newborn cards truly hidden at deck until deal starts
-                                     if (bornAtDeck) { aiCard.visible = false; aiCard.opacity = 0.0 }
-
-                                     if (mainPage.dealingPaused || mainPage.capturePending) {
-                                        // During capture/deal-pause: only gate newly dealt cards.
-                                        if (bornAtDeck) {
-                                            opacity = 0.0;
-                                            waitDealTimer.start();
-                                        } else {
-                                            opacity = 1.0;
-                                        }
-                                    } else {
-                                        startDealIfNeeded();
-                                    }
-                                }
-
-                                Timer {
-                                    id: waitDealTimer
-                                    interval: 50
-                                    repeat: true
-                                    running: false
-                                    onTriggered: {
-                                        if (!mainPage.dealingPaused && !mainPage.capturePending && mainPage.pileFlightsInProgress === 0) {
-                                             stop();
-                                             if (bornAtDeck) {
-                                                 mainPage.seenAiIds[modelData.id] = true
-                                                 opacity = 1.0
-                                        aiCard.visible = true
-                                                 dealTimer.restart()
-                                             } else {
-                                                 opacity = 1.0
-                                             }
-                                        }
-                                    }
-                                }
-
-                                Timer {
-                                    id: deferDealStartTimer
-                                    interval: 0
-                                    repeat: false
-                                    running: false
-                                    onTriggered: {
-                                        if (mainPage.dealingPaused || mainPage.capturePending || mainPage.pileFlightsInProgress > 0) {
-                                            aiCard.opacity = 0
-                                            waitDealTimer.start()
-                                            return
-                                        }
-                                        aiCard.opacity = 0.9
-                                        dealTimer.start()
-                                    }
-                                }
-
-                                Timer {
-                                    id: dealTimer
-                                    interval: dealDelay
-                                    repeat: false
-                                    onTriggered: {
-                                        aiCard.visible = true
-                                        aiCard.opacity = 1.0
-                                        // Start position = centered on dealOrigin
-                                        dealOffsetX = (aiHandArea.dealOrigin.x - width / 2) - finalX
-                                        dealOffsetY = (aiHandArea.dealOrigin.y - height / 2) - finalY
-
-                                        dealAnim.restart()
-                                    }
-                                }
-
-                                ParallelAnimation {
-                                    id: dealAnim
-
-                                    PropertyAnimation {
-                                        target: aiCard
-                                        property: "dealOffsetX"
-                                        to: 0
-                                        duration: dur(260)
-                                        easing.type: Easing.OutCubic
-                                    }
-
-                                    PropertyAnimation {
-                                        target: aiCard
-                                        property: "dealOffsetY"
-                                        to: 0
-                                        duration: dur(260)
-                                        easing.type: Easing.OutCubic
-                                    }
-
-                                    onStopped: bornAtDeck = false
-                                }
-                            }
-                        }
+                    WonPile {
+                        id: ai3WonPile
+                        visible: engine.teamGame
+                        anchors.top: aiTopHandArea.bottom
+                        anchors.right: playerWonPile.right
+                        anchors.topMargin: Theme.paddingMedium
+                        width: Theme.itemSizeMedium
+                        height: width * 1.4
+                        z: 0.5
+                        playerName: mainPage.nameFor(3)
+                        cards: mainPage.wonFor(3)
+                        score: mainPage.scoreFor(3)
+                        cardStyle: appSettings.cardStyle
+                        accentColor: "#ef5350"
                     }
 
                     Item {
                         id: deckArea
                         anchors.right: parent.right
-                        anchors.rightMargin: Theme.paddingLarge * 2
+                        anchors.rightMargin: engine.teamGame
+                                             ? Theme.itemSizeLarge * 1.45
+                                             : Theme.paddingLarge * 2
                         anchors.verticalCenter: parent.verticalCenter
-                        anchors.verticalCenterOffset: -deckArea.height * 1.4
-
+                        anchors.verticalCenterOffset: -height * 1.4
                         width: Theme.itemSizeLarge
                         height: Theme.itemSizeLarge * 1.4
                         z: 0.8
 
                         Repeater {
                             model: Math.min(engine.deckSize, 5)
-
                             delegate: Card {
-                                id: deckCard
+                                cardId: "0_7"
+                                cardStyle: appSettings.cardStyle
                                 faceUp: false
-                                cardId: "0_0"   // dummy, never shown because faceUp=false
-
-                                // Small size deck
                                 width: Theme.itemSizeLarge
                                 height: Theme.itemSizeLarge * 1.4
-
                                 x: index * 2
                                 y: index * 2
                                 z: -index
                                 opacity: 0.85
-                                scale: index === 0 ? 1.0 : 0.96   // only stack cards are smaller
+                                scale: index === 0 ? 1.0 : 0.96
                             }
                         }
-
-// Card counter on Deck
-//                        Label {
-//                            anchors.top: deckArea.top
-//                            anchors.horizontalCenter: deckArea.horizontalCenter
-//                            text: "Deck: " + engine.deckSize
-//                            font.pixelSize: Theme.fontSizeTiny
-//                            color: Theme.secondaryColor
-//                        }
                     }
 
-                    // Deck deal point “marker”
                     Item {
                         id: deckDealPoint
                         width: 1
                         height: 1
-                        z: deckArea.z + 1
-
-                        // exact center of the top visible card in the deck stack
                         anchors.horizontalCenter: deckArea.horizontalCenter
                         anchors.verticalCenter: deckArea.verticalCenter
                     }
 
-                    // Table deal point "marker"
-                    Item {
-                        id: tableDealPoint
-                        width: 1
-                        height: 1
-                        z: tableBackground.z + 1
-                        anchors.horizontalCenter: tableBackground.horizontalCenter
-                        anchors.verticalCenter: tableBackground.verticalCenter
-                    }
-
-                    /* =========================
-                       TABLE AREA (center)
-                       ========================= */
                     Item {
                         id: tableRow
                         anchors.horizontalCenter: parent.horizontalCenter
                         anchors.verticalCenter: parent.verticalCenter
                         width: 1
                         height: 1
-                        z: 0
-
-                        onChildrenChanged: {
-                            // Note: static table cards can appear immediately when engine.tableCards updates,
-                            // while the flying clone is still in flight. Starting exit here causes a visible
-                            // disappear/reappear glitch. We start exit only when the flying cards report landed.
-                        }
-
-                        Connections {
-                            target: engine
-
-                            onStateChanged: {
-                                var len = engine.tableCards.length
-                                if (len > 0)
-                                    lastTableSnapshot = engine.tableCards.slice(0)
-                                if (len > lastTableCount) {
-                                    var last = engine.tableCards[len - 1]
-                                    if (last.playedBy === 1) {
-                                        mainPage.aiFlyingActive = true
-                                        mainPage.hideAiStaticId = last.id
-                                        mainPage.pendingAiCardId = last.id
-            if (mainPage.dealPhaseActive) {
-                // Defer AI play animation until dealing visuals complete
-                mainPage.aiSpawnDeferred = true
-            } else {
-                aiSpawnTimer.restart()
-            }
-                                    }
-                                } else if (len === 0 && lastTableCount > 0) {
-                                    // Table cleared: animate capture from snapshot
-                                    animateTableCardsToWinnerFrom(lastTableSnapshot)
-                                }
-                                lastTableCount = len
-                            }
-                        }
 
                         Repeater {
                             model: engine.tableCards
-
                             delegate: Card {
-                                id: tableCard
                                 cardId: modelData.id
+                                cardStyle: appSettings.cardStyle
                                 faceUp: true
-                                Component.onCompleted: {
-                                    mainPage.tableCardRefs[cardId] = tableCard
-                                    // If a flying-to-table clone exists for this cardId, destroy it now.
-                                    var landed = mainPage.landedFlyingCards[cardId]
-                                    if (landed) {
-                                        landed.destroy()
-                                        delete mainPage.landedFlyingCards[cardId]
-                                    }
-
-                                }
-                                Component.onDestruction: { if (mainPage.tableCardRefs[cardId] === tableCard) delete mainPage.tableCardRefs[cardId] }
-
-                                // Stacking + layout for up to 4 cards
+                                x: -width / 2 + mainPage.tableCardOffsetX(modelData.id, index)
+                                y: -height / 2 + mainPage.tableCardOffsetY(modelData.id, index)
+                                rotation: mainPage.tableCardRotation(modelData.id, index)
                                 z: index
-
-                                // Fan/stack so all cards remain visible
-                                x: -width/2
-                                y: -height / 2 + index * Theme.paddingMedium * 1.10
-                                rotation: -12 + index * 6
-
-                                // Hide the newest AI table card while its flying clone is animating
-                                opacity: (!mainPage.animationsEnabled) ? 1.0 : ((modelData.playedBy === 1 && mainPage.aiFlyingActive && modelData.id === mainPage.hideAiStaticId) ? 0.0 : 1.0)
-
-                                Behavior on x { NumberAnimation { duration: 220; easing.type: Easing.OutCubic } }
-                                Behavior on y { NumberAnimation { duration: 220; easing.type: Easing.OutCubic } }
-                                Behavior on rotation { NumberAnimation { duration: 220; easing.type: Easing.OutCubic } }
-                                Behavior on opacity { NumberAnimation { duration: 0 } }
+                                opacity: mainPage.hiddenTableId === "*"
+                                         || mainPage.hiddenTableId === modelData.id ? 0.0 : 1.0
                             }
                         }
                     }
 
-                    Timer {
-                        id: exitTimer
-                        interval: 350
-                        repeat: false
-                        onTriggered: {
-                            // Trigger exit animation on all table cards
-                            for (var i = 0; i < tableRow.children.length; ++i) {
-                                var c = tableRow.children[i]
-                                if (c && c.objectName === "tableCard") {
-                                    c.exiting = true
-                                }
-                            }
-                        }
-                    }
-
-                    Timer {
-                        id: resolveTrickTimer
-                        interval: mainPage.trickResolveDelay
-                        repeat: false
-                        onTriggered: {
-                            // Remove landed flying-to-table clones now that static table delegates exist
-                            for (var k in mainPage.landedFlyingCards) {
-                                var obj = mainPage.landedFlyingCards[k];
-                                if (obj) obj.destroy();
-                            }
-                            mainPage.landedFlyingCards = ({})
-
-                            // Delay is over, NOW fly table cards to the winner pile
-                            mainPage.phase = "toPile"
-                            animateTableCardsToWinner()
-                            // Do NOT call engine.resolveCurrentTrick() here anymore.
-                            // That happens when pile flights finish.
-                        }
-                    }
-
-                    /* =========================
-                       WON CARDS – PLAYER
-                       ========================= */
-                    Item {
+                    WonPile {
                         id: playerWonPile
                         anchors.bottom: handArea.top
                         anchors.right: handArea.right
                         anchors.bottomMargin: Theme.paddingMedium
-                        width: Theme.itemSizeLarge
-                        height: Theme.itemSizeLarge * 1.4
+                        anchors.rightMargin: mainPage.wonPileEdgeMargin
+                        width: Theme.itemSizeMedium
+                        height: width * 1.4
                         z: 0.5
-
-                        Label {
-                            id: playerZsirLabel
-                            text: engine.playerScore
-                            visible: Number(engine.playerScore) > 0
-                            anchors.horizontalCenter: parent.horizontalCenter
-                            y: -height - Theme.paddingSmall
-                            font.pixelSize: Theme.fontSizeSmall
-                        }
-
-                        // Playe won cards pile area
-                        Rectangle {
-                            anchors.fill: parent
-                            radius: Theme.paddingSmall
-                            color: "#00c853"
-                            opacity: 0.08
-                            z: -2
-                        }
-                        Repeater {
-                            model: engine.playerWonCards
-
-                            delegate: Card {
-                                cardId: modelData.id
-                                faceUp: false
-                                width: Theme.itemSizeLarge * 0.8
-                                height: Theme.itemSizeLarge * 1.12
-                                x: index * 2
-                                y: index * 2
-                                z: index
-                                scale: 0.9
-                                rotation: (index % 2 === 0 ? -2 : 2) * Math.min(index, 3)
-                                transformOrigin: Item.Center
-                                opacity: index >= model.count - 3 ? 1.0 : 0.6
-
-                                Behavior on x { NumberAnimation { duration: 200 } }
-                                Behavior on y { NumberAnimation { duration: 200 } }
-                                Behavior on rotation { NumberAnimation { duration: 200 } }
-                            }
-                        }
+                        playerName: mainPage.nameFor(0)
+                        cards: mainPage.wonFor(0)
+                        score: mainPage.scoreFor(0)
+                        cardStyle: appSettings.cardStyle
+                        accentColor: "#66bb6a"
+                        inspectable: true
+                        onClicked: mainPage.openWonCards(0)
                     }
 
-
-                    /* =========================
-                       PLAYER HAND (bottom)
-                       ========================= */
                     Item {
                         id: handArea
                         anchors.left: parent.left
@@ -1216,531 +774,164 @@ var target = tableDealPoint.mapToItem(animationLayer, 0, 0)
                         anchors.bottomMargin: Theme.paddingLarge
                         height: Theme.itemSizeLarge * 2
                         z: 1
-                        clip: false
                         enabled: engine.roundResult.length === 0
-                        scale: engine.status === "Your turn" ? 1.0 : 0.98
-
-                        property point dealOrigin: Qt.point(0, 0)
-
-                        function updateDealOrigin() {
-                            // Step 1: deck top → scene (Player deal origin)
-                            // Step 2: scene → handArea
-                            var scenePos = deckDealPoint.mapToItem(null, 0, 0)
-                            dealOrigin = handArea.mapFromItem(null, scenePos.x, scenePos.y)
-                        }
-
-                        Component.onCompleted: {
-                            // wait one frame so deckArea has final geometry
-                            updateDealOriginTimerPlayer.restart()
-                        }
-
-                        Timer {
-                            id: updateDealOriginTimerPlayer
-                            interval: 0
-                            repeat: false
-                            onTriggered: handArea.updateDealOrigin()
-                        }
-                        Connections {
-                            target: deckArea
-                            onXChanged: handArea.updateDealOrigin()
-                            onYChanged: handArea.updateDealOrigin()
-                            onWidthChanged: handArea.updateDealOrigin()
-                            onHeightChanged: handArea.updateDealOrigin()
-                        }
-
-                        Connections {
-                            target: engine
-                            onStateChanged: {
-                                if (engine.playerHand.length === 4) {
-                                }
-                            }
-                        }
-
-                        Behavior on scale {
-                            NumberAnimation { duration: (mainPage.layoutFrozen ? 0 : dur(200)); easing.type: Easing.OutCubic }
-                        }
-
-                        opacity: engine.roundResult.length > 0
-                                 ? 0.4
-                                 : (engine.status === "Your turn" ? 1.0 : 0.85)
-
-                        Behavior on opacity {
-                            NumberAnimation { duration: 150 }
-                        }
-
-// Visual debug
-//                        Rectangle {
-//                            width: 10; height: 10
-//                            radius: 5
-//                            color: "red"
-//                            x: handArea.dealOrigin.x - 5
-//                            y: handArea.dealOrigin.y - 5
-//                            z: 10
-//                        }
 
                         Rectangle {
-                            id: handHighlight
                             anchors.fill: parent
                             radius: Theme.paddingLarge
                             color: Theme.highlightColor
-                            opacity: engine.status === "Your turn" ? 0.12 : 0.04
+                            opacity: engine.playerInputEnabled ? 0.12 : 0.04
                             z: -1
-
-                            Behavior on opacity {
-                                NumberAnimation { duration: 200 }
-                            }
+                            Behavior on opacity { NumberAnimation { duration: 160 } }
                         }
 
                         Repeater {
                             model: engine.playerHand
-
                             delegate: MouseArea {
-                                id: mouseArea
-
-                                enabled: engine.playerInputEnabled &&
-                                         (!engine.canLeave || modelData.rank === engine.cardToHit || modelData.rank === 7) &&
-                                         !bornAtDeck && opacity > 0.2
-
+                                id: playerMouse
                                 property int count: engine.playerHand.length
-                                property real centerIndex: (count - 1) / 2
-                                property real distanceFromCenter: Math.abs(index - centerIndex)
-                                property real spacing: card.width * 0.6
-                                property real handWidth: (count - 1) * spacing + card.width
-                                property bool bornAtDeck: false
-                                property int dealDelay: (index * dur(220)) + ((bornAtDeck && mainPage.dealFirstSide === 1) ? mainPage.dealLoserExtraMs : 0)  // PLAYER delays when AI draws first
-                                property real dealOffsetX: 0
-                                property real dealOffsetY: 0
-                                property bool isBeingPlayed: false
-
-                                property real finalX: (handArea.width / 2)
-                                                     - ((count - 1) * card.width * 0.3)
-                                                     + index * (card.width * 0.6)
-
-                                property real finalY: 0
-
-                                width: card.width
-                                height: card.height
-
-// center the whole hand
-//                                x: (handArea.width - handWidth) / 2 + index * spacing
-
-// show the whole hand at the right
-//                                x: (handArea.width / 2)
-//                                   - ((count - 1) * card.width * 0.3)
-//                                   + index * (card.width * 0.6)
-
-                                // Deal from deck to hand
-                                x: bornAtDeck ? (handArea.dealOrigin.x - width/2) : finalX
-                                y: bornAtDeck ? (handArea.dealOrigin.y - height/2) : finalY
+                                property real cardWidth: Theme.itemSizeLarge * 1.4
+                                property real cardHeight: cardWidth * 1.4
+                                width: cardWidth
+                                height: cardHeight
+                                x: handArea.width / 2
+                                   - ((count - 1) * cardWidth * 0.3)
+                                   + index * (cardWidth * 0.6)
+                                y: 0
+                                z: index
+                                // The explicit property read makes this binding
+                                // re-evaluate when stateChanged releases the deal
+                                // phase.  An invokable call alone has no QML
+                                // dependency and remained false after initial deal.
+                                enabled: engine.playerInputEnabled
+                                         && engine.isPlayerCardPlayable(index)
+                                         && !mainPage.hiddenDealIds[modelData.id]
 
                                 onClicked: {
-                                    if (bornAtDeck || opacity <= 0.2) return
-                                    if (isBeingPlayed) return            // prevent double-tap spam
-                                    if (!mainPage.animationsEnabled) {
-                                        playTimer.start()
-                                        return
-                                    }
-                                    isBeingPlayed = true                 // hide immediately (we spawn a flying clone)
-                                    var p = mouseArea.mapToItem(animationLayer,
-                                                                mouseArea.width / 2,
-                                                                mouseArea.height / 2)
-                                    spawnFlyingCard(card.cardId, p)
-                                    playTimer.start()
+                                    // Copy primitive coordinates before playCard()
+                                    // changes the hand model and destroys this delegate.
+                                    var scenePoint = playerMouse.mapToItem(
+                                                null, width / 2, height / 2)
+                                    var startPoint = animationLayer.mapFromItem(
+                                                null, scenePoint.x, scenePoint.y)
+                                    mainPage.pendingPlayerStartX = startPoint.x
+                                    mainPage.pendingPlayerStartY = startPoint.y
+                                    engine.playCard(index)
                                 }
-                                onPressed: card.pressed = true
-                                onReleased: card.pressed = false
-                                onCanceled: card.pressed = false
-
-                                Behavior on x {
-                                    NumberAnimation { duration: (mainPage.layoutFrozen ? 0 : dur(200)); easing.type: Easing.OutCubic }
-                                }
-
-                                Behavior on y {
-                                    NumberAnimation { duration: (mainPage.layoutFrozen ? 0 : dur(240)); easing.type: Easing.OutCubic }
-                                }
-
-                                function startDealIfNeeded() {
-                                    // If we already handled this card, just make sure it is visible.
-                                    if (mainPage.seenPlayerIds[modelData.id]) {
-                                        mouseArea.opacity = 1.0
-                                        return
-                                    }
-
-                                    if (bornAtDeck) {
-                                        // Newly dealt card: if we are currently gating dealing, keep it hidden and wait.
-                                        if (mainPage.dealingPaused || mainPage.capturePending || mainPage.pileFlightsInProgress > 0) {
-                                            mouseArea.opacity = 0
-                                            waitDealTimer.start()
-                                            return
-                                        }
-
-                                        // We are allowed to deal now.
-                                        mainPage.seenPlayerIds[modelData.id] = true
-                                        mouseArea.opacity = 0
-                                        // x/y are bound to bornAtDeck; keep bornAtDeck=true until dealAnim stops.
-                                        deferDealStartTimer.restart()
-                                    } else {
-                                        // Existing hand card (not from deck)
-                                        mainPage.seenPlayerIds[modelData.id] = true
-                                        mouseArea.opacity = 1.0
-                                    }
-                                }
-
-                                Component.onCompleted: {
-                                     // Decide once per delegate if this card should animate from deck.
-                                     // Important: do NOT bind bornAtDeck to seen/dealingPaused, otherwise it flips mid-flow.
-                                     bornAtDeck = mainPage.freshRound || (!mainPage.seenPlayerIds[modelData.id])
-                                     // Prevent flicker / phantom taps: keep newborn cards truly hidden at deck until deal starts
-                                     if (bornAtDeck) { mouseArea.visible = false; mouseArea.opacity = 0.0 }
-
-                                     // After first hand is created, we are no longer in fresh round
-                                    // (this runs multiple times; safe)
-                                    mainPage.freshRound = false
-
-                                    if (mainPage.dealingPaused || mainPage.capturePending) {
-                                        // During capture/deal-pause: only gate *newly dealt* cards.
-                                        // Already-in-hand cards must remain visible (delegates can be recreated while paused).
-                                        if (bornAtDeck) {
-                                            mouseArea.opacity = 0
-                                            waitDealTimer.start()
-                                        } else {
-                                            mouseArea.opacity = 1.0
-                                        }
-                                    } else {
-                                        startDealIfNeeded()
-                                    }
-                                }
-
-                                Timer {
-                                    id: waitDealTimer
-                                    interval: 50
-                                    repeat: true
-                                    running: false
-                                    onTriggered: {
-                                        if (!mainPage.dealingPaused && !mainPage.capturePending && mainPage.pileFlightsInProgress === 0) {
-                                             stop()
-                                             if (bornAtDeck) {
-                                                 // Start the actual deal animation now (even if seen was set earlier).
-                                                 mainPage.seenPlayerIds[modelData.id] = true
-                                                 mouseArea.opacity = 1.0
-                                        mouseArea.visible = true
-                                                 dealTimer.restart()
-                                             } else {
-                                                 // Delegate recreated while paused; restore visibility.
-                                                 mouseArea.opacity = 1.0
-                                             }
-                                        }
-                                    }
-                                }
-
-                                Timer {
-                                    id: deferDealStartTimer
-                                    interval: 0
-                                    repeat: false
-                                    running: false
-                                    onTriggered: {
-                                        if (mainPage.dealingPaused || mainPage.capturePending || mainPage.pileFlightsInProgress > 0) {
-                                            mouseArea.opacity = 0
-                                            waitDealTimer.start()
-                                            return
-                                        }
-                                        mouseArea.opacity = 1.0
-                                        dealTimer.start()
-                                    }
-                                }
-
-                                Timer {
-                                    id: dealTimer
-                                    interval: dealDelay
-                                    repeat: false
-                                    onTriggered: {
-                                        mouseArea.visible = true
-                                        mouseArea.opacity = 1.0
-                                        if (bornAtDeck) {
-                                            card.faceUp = false        // ensure starts faceDown
-                                            dealFlipTimer.restart()    // flip halfway through dealAnim
-                                        }
-                                        dealAnim.restart()
-                                    }
-                                }
-
-                                Timer {
-                                    id: dealFlipTimer
-                                    interval: dur(250)               // scaled
-                                    repeat: false
-                                    onTriggered: dealFlipAnim.start()
-                                }
-
-                                Timer {
-                                    id: playTimer
-                                    interval: dur(500)
-                                    repeat: false
-                                    onTriggered: engine.playCard(index)
-                                }
-
-                                ParallelAnimation {
-                                    id: dealAnim
-
-                                    PropertyAnimation {
-                                        target: mouseArea
-                                        property: "x"
-                                        to: mouseArea.finalX
-                                        duration: dur(280)
-                                        easing.type: Easing.OutCubic
-                                    }
-
-                                    PropertyAnimation {
-                                        target: mouseArea
-                                        property: "y"
-                                        to: mouseArea.finalY
-                                        duration: dur(280)
-                                        easing.type: Easing.OutCubic
-                                    }
-
-                                    onStopped: bornAtDeck = false
-                                }
+                                onPressed: playerCard.pressed = true
+                                onReleased: playerCard.pressed = false
+                                onCanceled: playerCard.pressed = false
 
                                 Card {
-                                    id: card
+                                    id: playerCard
                                     cardId: modelData.id
-                                    faceUp: !mouseArea.bornAtDeck   // faceDown during deal, faceUp otherwise
-
-                                    scale: bornAtDeck ? 0.72 : 1.0
-
-                                    property int count: engine.playerHand.length
-                                    property real centerIndex: (count - 1) / 2
-                                    property real distanceFromCenter: Math.abs(index - centerIndex)
-
-                                    y: 0
-
-                                    opacity: isBeingPlayed ? 0 : 1
-                                    Behavior on opacity { NumberAnimation { duration: 80 } }
-
-                                    Behavior on scale {
-                                        NumberAnimation {
-                                            duration: dur(260)
-                                            easing.type: Easing.OutCubic
-                                        }
-                                    }
-
-                                    transform: Rotation {
-                                        id: dealFlip
-                                        origin.x: card.width / 2
-                                        origin.y: card.height / 2
-                                        axis { x: 0; y: 1; z: 0 }
-                                        angle: 0
-                                    }
-
-                                    SequentialAnimation {
-                                        id: dealFlipAnim
-                                        PropertyAnimation {
-                                            target: dealFlip
-                                            property: "angle"
-                                            from: 0
-                                            to: 80
-                                            duration: 80
-                                            easing.type: Easing.InQuad
-                                        }
-                                        ScriptAction { script: card.faceUp = true }
-                                        PropertyAnimation {
-                                            target: dealFlip
-                                            property: "angle"
-                                            from: 80
-                                            to: 0
-                                            duration: 80
-                                            easing.type: Easing.OutQuad
-                                        }
-                                    }
+                                    cardStyle: appSettings.cardStyle
+                                    faceUp: true
+                                    opacity: mainPage.hiddenDealIds[modelData.id] ? 0.0 : 1.0
                                 }
                             }
                         }
                     }
 
-                    // Let it go button (only when engine offers the choice)
                     Button {
-                        id: letGoButton
                         text: qsTr("Let it go")
                         anchors.horizontalCenter: handArea.horizontalCenter
                         anchors.bottom: handArea.top
                         anchors.bottomMargin: Theme.paddingLarge
-                        visible: engine && engine.canLeave
-                        enabled: engine && engine.canLeave
+                        visible: engine.canLeave
+                        enabled: engine.canLeave
                         onClicked: engine.playerLeave()
                         z: 50
                     }
+                }
 
-                } // end of gameRoot
-
-                
                 Label {
                     id: statusLabel
-
                     anchors.horizontalCenter: parent.horizontalCenter
                     anchors.top: parent.top
                     anchors.topMargin: Theme.paddingMedium
-
-                    text: engine.status
+                    width: parent.width - 2 * Theme.horizontalPageMargin
+                    horizontalAlignment: Text.AlignHCenter
+                    text: engine.teamGame
+                          ? engine.status + "\n" + qsTr("Your team %1  •  Opponents %2")
+                            .arg(engine.teamScore).arg(engine.opponentScore)
+                          : engine.status
                     font.pixelSize: Theme.fontSizeMedium
                     color: Theme.secondaryColor
-
-                    Behavior on text {
-                        SequentialAnimation {
-                            PropertyAnimation { property: "opacity"; to: 0; duration: 80 }
-                            PropertyAnimation { property: "opacity"; to: 1; duration: 120 }
-                        }
-                    }
+                    z: 100
                 }
-//------------------------------------------------------------------------------------
+
                 Label {
                     id: lastTrickLabel
-
                     anchors.horizontalCenter: parent.horizontalCenter
                     anchors.top: statusLabel.bottom
                     anchors.topMargin: Theme.paddingSmall
-                    property bool playerWon: text.indexOf("You won") === 0
-                    property bool cpuWon: text.indexOf("AI won") === 0
-
                     text: engine.lastTrick
-                    visible: text.length > 0
-
+                    visible: opacity > 0 && text.length > 0
+                    opacity: text.length > 0 ? 1.0 : 0.0
                     font.pixelSize: Theme.fontSizeSmall
-
-                    Behavior on opacity {
-                        NumberAnimation { duration: 150 }
-                    }
+                    color: Theme.highlightColor
+                    z: 100
 
                     onTextChanged: {
                         if (text.length > 0) {
-                            opacity = 0
-                            scale = 1.0
-                            appearTimer.restart()
+                            lastTrickLabel.opacity = 1.0
+                            hideLastTrick.restart()
                         }
                     }
-
                     Timer {
-                        id: appearTimer
-                        interval: 200    // aligns with score pop
-                        repeat: false
-                        onTriggered: {
-                            lastTrickLabel.opacity = 1
-                            hideTimer.restart()
-                        }
-                    }
-
-                    Timer {
-                        id: hideTimer
+                        id: hideLastTrick
                         interval: 2000
                         repeat: false
-                        onTriggered: lastTrickLabel.opacity = 0
+                        onTriggered: lastTrickLabel.opacity = 0.0
                     }
-
-                    color: playerWon
-                           ? Theme.primaryColor
-                           : cpuWon
-                             ? Theme.secondaryColor
-                             : Theme.highlightColor
-
-                    scale: (playerWon || cpuWon) ? 1.05 : 1.0
-
-                    Behavior on scale {
-                        NumberAnimation { duration: 160; easing.type: Easing.OutCubic }
-                    }
+                    Behavior on opacity { NumberAnimation { duration: 180 } }
                 }
-//------------------------------------------------------------------------------------
-                Row {
-                    id: scoreRow
+
+                Item {
+                    id: roundResultPanel
                     anchors.horizontalCenter: parent.horizontalCenter
-                    anchors.top: lastTrickLabel.bottom
-                    anchors.topMargin: Theme.paddingSmall
-                    spacing: Theme.paddingLarge
-
-                    Label {
-                        id: playerScoreLabel
-                                                text: appSettings.ai1Name
-                        font.pixelSize: Theme.fontSizeSmall
-                        color: Theme.primaryColor
-                        Behavior on opacity { NumberAnimation { duration: 0 } }
-
-                    }
-
-                    Label {
-                        id: cpuScoreLabel
-                        visible: false
-                        text: appSettings.ai1Name + ": " + engine.cpuScore
-                        font.pixelSize: Theme.fontSizeSmall
-                        color: Theme.secondaryColor
-                        Behavior on opacity { NumberAnimation { duration: 0 } }
-
-                        property int lastScore: engine.cpuScore
-
-                        onTextChanged: {
-                            if (engine.cpuScore > lastScore) {
-                                cpuScorePop.restart()
-                            }
-                            lastScore = engine.cpuScore
-                        }
-
-                        SequentialAnimation {
-                            id: cpuScorePop
-
-                            PropertyAnimation {
-                                target: cpuScoreLabel
-                                property: "scale"
-                                to: 1.15
-                                duration: 120
-                                easing.type: Easing.OutCubic
-                            }
-
-                            PropertyAnimation {
-                                target: cpuScoreLabel
-                                property: "scale"
-                                to: 1.0
-                                duration: 160
-                                easing.type: Easing.OutCubic
-                            }
-                        }
-                    }
-                }
-//------------------------------------------------------------------------------------                
-                Label {
-                    id: roundResultLabel
-
-                    anchors.horizontalCenter: parent.horizontalCenter
-                    anchors.top: scoreRow.bottom
-                    anchors.topMargin: Theme.paddingMedium
-
-                    text: engine.roundResult
-                    visible: text.length > 0
-
-                    font.pixelSize: Theme.fontSizeLarge
-                    horizontalAlignment: Text.AlignHCenter
-                    width: parent.width
-                    color: Theme.highlightColor
-
-                    Behavior on opacity {
-                        NumberAnimation { duration: 200 }
-                    }
-
-                    scale: text.length > 0 ? 1.1 : 1.0
-
-                    Behavior on scale {
-                        NumberAnimation { duration: (mainPage.layoutFrozen ? 0 : dur(200)); easing.type: Easing.OutCubic }
-                    }
-                }
-                
-                Button {
-                    text: "New Game"
-                    anchors.horizontalCenter: parent.horizontalCenter
-                    anchors.top: roundResultLabel.bottom
-                    anchors.topMargin: Theme.paddingLarge
-                    highlighted: true
+                    anchors.verticalCenter: parent.verticalCenter
+                    anchors.verticalCenterOffset: -Theme.itemSizeLarge * 0.5
+                    width: parent.width - 2 * Theme.horizontalPageMargin
+                    height: resultContent.height + 2 * Theme.paddingLarge
                     visible: engine.roundResult.length > 0
-                    onClicked: engine.newGame()
+                    z: 100
+
+                    Rectangle {
+                        anchors.fill: parent
+                        radius: Theme.paddingLarge
+                        color: "#cc123716"
+                        border.color: Theme.highlightColor
+                        border.width: 1
+                    }
+
+                    Column {
+                        id: resultContent
+                        anchors.centerIn: parent
+                        width: parent.width - 2 * Theme.paddingLarge
+                        spacing: Theme.paddingLarge
+
+                        Label {
+                            id: roundResultLabel
+                            width: parent.width
+                            text: engine.roundResult
+                            horizontalAlignment: Text.AlignHCenter
+                            wrapMode: Text.WordWrap
+                            font.pixelSize: Theme.fontSizeLarge
+                            font.bold: true
+                            color: Theme.highlightColor
+                        }
+
+                        Button {
+                            text: qsTr("New Game")
+                            anchors.horizontalCenter: parent.horizontalCenter
+                            highlighted: true
+                            onClicked: mainPage.restartGame()
+                        }
+                    }
                 }
-                
-            } // end of SilicaFlickable
+            }
         }
     }
-
-
 }

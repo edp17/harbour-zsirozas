@@ -1,752 +1,509 @@
 #include "GameEngine.h"
 
-#include <algorithm>
-#include <random>
-#include <QVariantMap>
+#include <QCoreApplication>
 #include <QDebug>
+#include <QDir>
+#include <QSettings>
+#include <QStandardPaths>
+#include <QVariantMap>
+#include <algorithm>
 
-// #define ZSIROZAS_TRACE 1
-#if defined(ZSIROZAS_TRACE)
-  #define TRACE(...) qDebug() << __VA_ARGS__
-#else
-  #define TRACE(...) do {} while (0)
-#endif
+using Zsirozas::AiAction;
+using Zsirozas::AiActionType;
+using Zsirozas::AiDifficulty;
+using Zsirozas::RoundResult;
 
-static std::mt19937 rng{ std::random_device{}() };
+namespace {
 
-QVariantList GameEngine::toVariantList(const QVector<Card>& v)
+const QString autosaveKey = QStringLiteral("game/autosave-v1");
+
+QString autosaveSettingsPath()
 {
-    QVariantList out;
-    out.reserve(v.size());
-    for (const Card& c : v) {
-        QVariantMap m;
-        m["rank"] = c.rank;
-        m["suit"] = c.suit;
-        m["id"] = c.id();
-        m["isZsir"] = c.isZsir();
-        m["playedBy"] = c.playedBy;
-        out << m;
-    }
-    return out;
+    const QString directory = QStandardPaths::writableLocation(
+        QStandardPaths::AppConfigLocation);
+    QDir().mkpath(directory);
+    return directory + QLatin1Char('/')
+        + QCoreApplication::applicationName() + QStringLiteral(".conf");
 }
 
-QVariantList GameEngine::playerHand() const { return toVariantList(m_player); }
-QVariantList GameEngine::cpuHand() const { return toVariantList(m_cpu); }
-QVariantList GameEngine::tableCards() const { return toVariantList(m_table); }
-QVariantList GameEngine::playerWonCards() const { return toVariantList(m_playerWon); }
-QVariantList GameEngine::cpuWonCards() const { return toVariantList(m_cpuWon); }
+} // namespace
 
 GameEngine::GameEngine(QObject* parent) : QObject(parent)
 {
     m_aiTimer.setSingleShot(true);
-    m_pileTimer.setSingleShot(true);
+    m_capturePauseTimer.setSingleShot(true);
+    m_visualWatchdog.setSingleShot(true);
+    connect(&m_aiTimer, &QTimer::timeout, this, &GameEngine::performAiMove);
+    connect(&m_capturePauseTimer, &QTimer::timeout, this, &GameEngine::requestPileAnimation);
+    connect(&m_visualWatchdog, &QTimer::timeout, this, &GameEngine::recoverTimedOutVisualPhase);
+    updateStatusText();
+}
 
-    connect(&m_aiTimer, &QTimer::timeout, this, [this]() {
-        if (m_turn != Turn::Cpu) return;
-        if (!m_roundResult.isEmpty()) return;
-        if (m_pilePending) return;
-        if (m_cpu.isEmpty()) {
-            // If there's an active pile, resolve it to last hitter.
-            if (!m_table.isEmpty() && !m_pilePending) {
-                scheduleRoundWin(m_lastHitter);
-            } else {
-                // No pile: if player still has cards, give them the turn; else finish.
-                if (!m_player.isEmpty()) {
-                    m_turn = Turn::Player;
-                    emit stateChanged();
-                } else if (isGameOverCondition()) {
-                    finishGame();
-                }
-            }
-            return;
+QString GameEngine::cardId(const Zsirozas::Card& card)
+{
+    return QString::number(card.suit) + QLatin1Char('_') + QString::number(card.rank);
+}
+
+QVariantList GameEngine::toVariantList(const std::vector<Zsirozas::Card>& cards)
+{
+    QVariantList result;
+    result.reserve(static_cast<int>(cards.size()));
+    for (const Zsirozas::Card& card : cards) {
+        QVariantMap item;
+        item[QStringLiteral("rank")] = card.rank;
+        item[QStringLiteral("suit")] = card.suit;
+        item[QStringLiteral("id")] = cardId(card);
+        item[QStringLiteral("isZsir")] = card.isZsir();
+        item[QStringLiteral("playedBy")] = card.playedBy;
+        result.append(item);
+    }
+    return result;
+}
+
+QVariantList GameEngine::initialDealList(const Zsirozas::GameCore& core)
+{
+    QVariantList result;
+    int order = 0;
+    for (int handIndex = 0; handIndex < 4; ++handIndex) {
+        for (int player = 0; player < core.playerCount(); ++player) {
+            if (handIndex >= static_cast<int>(core.hand(player).size()))
+                continue;
+            QVariantMap item;
+            item[QStringLiteral("player")] = player;
+            item[QStringLiteral("id")] = cardId(core.hand(player)[static_cast<std::size_t>(handIndex)]);
+            item[QStringLiteral("handIndex")] = handIndex;
+            item[QStringLiteral("order")] = order++;
+            result.append(item);
         }
-
-        const int idx = chooseCpuIndex();
-        if (idx < 0) return;
-        applyMove(Turn::Cpu, idx);
-    });
-
-    connect(&m_pileTimer, &QTimer::timeout, this, [this]() {
-        commitPile();
-    });
-
-    newGame();
+    }
+    return result;
 }
 
-void GameEngine::setAiPlayDelay(int ms)
+QVariantList GameEngine::drawList(const std::vector<Zsirozas::DrawnCard>& cards)
 {
-    if (m_aiPlayDelay == ms) return;
-    m_aiPlayDelay = ms;
-    emit aiPlayDelayChanged();
+    QVariantList result;
+    result.reserve(static_cast<int>(cards.size()));
+    int order = 0;
+    for (const Zsirozas::DrawnCard& drawn : cards) {
+        QVariantMap item;
+        item[QStringLiteral("player")] = drawn.player;
+        item[QStringLiteral("id")] = cardId(drawn.card);
+        item[QStringLiteral("handIndex")] = drawn.handIndex;
+        item[QStringLiteral("order")] = order++;
+        result.append(item);
+    }
+    return result;
 }
 
-void GameEngine::setAiDifficulty(int difficulty)
+QVariantList GameEngine::participants() const
 {
-    if (difficulty < static_cast<int>(AiDifficulty::Easy))
-        difficulty = static_cast<int>(AiDifficulty::Easy);
-    if (difficulty > static_cast<int>(AiDifficulty::Expert))
-        difficulty = static_cast<int>(AiDifficulty::Expert);
+    QVariantList result;
+    for (int player = 0; player < m_core.playerCount(); ++player) {
+        QVariantMap item;
+        item[QStringLiteral("index")] = player;
+        item[QStringLiteral("name")] = playerDisplayName(player);
+        item[QStringLiteral("isHuman")] = player == 0;
+        item[QStringLiteral("team")] = m_core.teamForPlayer(player);
+        item[QStringLiteral("hand")] = toVariantList(m_core.hand(player));
+        item[QStringLiteral("handCount")] = static_cast<int>(m_core.hand(player).size());
+        item[QStringLiteral("wonCards")] = toVariantList(m_core.wonCards(player));
+        item[QStringLiteral("wonCount")] = static_cast<int>(m_core.wonCards(player).size());
+        item[QStringLiteral("score")] = m_core.playerPoints(player);
+        result.append(item);
+    }
+    return result;
+}
 
-    if (m_aiDifficulty == difficulty)
+QVariantList GameEngine::playerHand() const { return toVariantList(m_core.hand(0)); }
+QVariantList GameEngine::cpuHand() const { return toVariantList(m_core.hand(1)); }
+QVariantList GameEngine::tableCards() const { return toVariantList(m_core.table()); }
+QVariantList GameEngine::playerWonCards() const { return toVariantList(m_core.wonCards(0)); }
+QVariantList GameEngine::cpuWonCards() const { return toVariantList(m_core.wonCards(1)); }
+
+QString GameEngine::playerDisplayName(int player) const
+{
+    const QString name = player >= 0 && player < 4 ? m_names[player].trimmed() : QString();
+    if (!name.isEmpty())
+        return name;
+    return player == 0 ? QStringLiteral("Player") : QStringLiteral("AI %1").arg(player);
+}
+
+QString GameEngine::teamDisplayName(int team) const
+{
+    if (!m_core.isTeamGame())
+        return playerDisplayName(team);
+    return playerDisplayName(team) + QStringLiteral(" & ") + playerDisplayName(team + 2);
+}
+
+QString GameEngine::roundResult() const
+{
+    switch (m_core.roundResult()) {
+    case RoundResult::Team0Won: return tr("%1 won the round").arg(teamDisplayName(0));
+    case RoundResult::Team1Won: return tr("%1 won the round").arg(teamDisplayName(1));
+    case RoundResult::None: return QString();
+    }
+    return QString();
+}
+
+void GameEngine::setPlayerCount(int count)
+{
+    count = count == 4 ? 4 : 2;
+    if (m_configuredPlayerCount == count)
         return;
+    m_configuredPlayerCount = count;
+    emit playerCountChanged();
+}
 
-    m_aiDifficulty = difficulty;
-    emit aiDifficultyChanged();
+void GameEngine::setName(int player, const QString& name)
+{
+    if (player < 0 || player >= 4 || m_names[player] == name)
+        return;
+    m_names[player] = name;
+    updateStatusText();
+    emit namesChanged();
+    emit roundResultChanged();
+    emit stateChanged();
+}
+
+void GameEngine::setDifficulty(int player, int difficulty)
+{
+    if (player < 1 || player >= 4)
+        return;
+    difficulty = std::max(static_cast<int>(AiDifficulty::Easy),
+                          std::min(static_cast<int>(AiDifficulty::Expert), difficulty));
+    if (m_aiDifficulties[player] == difficulty)
+        return;
+    m_aiDifficulties[player] = difficulty;
+    emit difficultiesChanged();
+}
+
+int GameEngine::difficultyForPlayer(int player) const
+{
+    return player >= 1 && player < 4 ? m_aiDifficulties[player]
+                                     : static_cast<int>(AiDifficulty::Normal);
+}
+
+void GameEngine::setAiPlayDelay(int milliseconds)
+{
+    milliseconds = std::max(0, milliseconds);
+    if (m_aiPlayDelay == milliseconds)
+        return;
+    m_aiPlayDelay = milliseconds;
+    emit aiPlayDelayChanged();
+    if (m_aiTimer.isActive())
+        scheduleAiMove();
+}
+
+void GameEngine::setAnimationsEnabled(bool enabled)
+{
+    if (m_animationsEnabled == enabled)
+        return;
+    m_animationsEnabled = enabled;
+    emit animationsEnabledChanged();
+    if (enabled)
+        return;
+    switch (m_visualPhase) {
+    case VisualPhase::CardFlight: completeCardAnimation(); break;
+    case VisualPhase::CapturePause: m_capturePauseTimer.stop(); requestPileAnimation(); break;
+    case VisualPhase::PileFlight: completePileAnimation(); break;
+    case VisualPhase::Deal: completeDealAnimation(); break;
+    case VisualPhase::Idle: break;
+    }
+}
+
+void GameEngine::setPaused(bool paused)
+{
+    if (m_paused == paused)
+        return;
+    m_paused = paused;
+    if (paused)
+        m_aiTimer.stop();
+    else
+        scheduleAiMove();
+    emit pausedChanged();
 }
 
 bool GameEngine::playerInputEnabled() const
 {
-    return m_roundResult.isEmpty()
-        && (m_turn == Turn::Player)
-        && !m_inputLocked
-        && !m_pilePending;
+    return m_visualPhase == VisualPhase::Idle && m_core.humanInputEnabled();
 }
 
-bool GameEngine::canLeave() const
+bool GameEngine::isPlayerCardPlayable(int handIndex) const
 {
-    if (!playerInputEnabled()) return false;
-    if (m_movesInPile < 2) return false;
-    if (m_haveToMove) return false;                 // decision phase
-    if (m_roundStarter != Turn::Player) return false; // starter must be human
-
-    // Decision only matters if someone else currently controls the pile
-    if (m_lastHitter == Winner::Player) return false;
-
-    // If player can't hit, engine should auto-resolve anyway
-    return handHasHitCard(m_player);
-}
-
-void GameEngine::initDeck()
-{
-    QVector<Card> deck;
-    deck.reserve(32);
-
-    // Hungarian deck: 7..Ace (14), 4 suits
-    for (int s = 0; s < 4; ++s) {
-        for (int r = 7; r <= 14; ++r) {
-            Card c;
-            c.rank = r;
-            c.suit = s;
-            deck.append(c);
-        }
-    }
-
-    std::shuffle(deck.begin(), deck.end(), rng);
-    m_talon = deck;
-}
-
-
-void GameEngine::refillHands(Winner firstDraws)
-{
-    const int talonBefore = m_talon.size();
-    const int pBefore = m_player.size();
-    const int cBefore = m_cpu.size();
-
-    int drewPlayer = 0;
-    int drewCpu = 0;
-
-    auto drawOne = [&](QVector<Card>& hand, bool isPlayer) {
-        if (!m_talon.isEmpty()) {
-            hand.append(m_talon.takeLast());
-            if (isPlayer) ++drewPlayer; else ++drewCpu;
-        }
-    };
-
-    auto needCard = [&](const QVector<Card>& hand) -> bool {
-        return hand.size() < 4;
-    };
-
-    const bool firstIsPlayer = (firstDraws == Winner::Player);
-    QVector<Card>* first  = firstIsPlayer ? &m_player : &m_cpu;
-    QVector<Card>* second = firstIsPlayer ? &m_cpu    : &m_player;
-
-    // Alternate draws: first, second, first, second... until both are full or talon empty.
-    while (!m_talon.isEmpty() && (needCard(*first) || needCard(*second))) {
-        if (needCard(*first) && !m_talon.isEmpty())
-            drawOne(*first, firstIsPlayer);
-        if (needCard(*second) && !m_talon.isEmpty())
-            drawOne(*second, !firstIsPlayer);
-    }
-
-    // --- Invariant checks (debug/warning) ---
-    const int talonAfter = m_talon.size();
-
-    // Talon should remain even in 2-player Zsírozás (32-card deck).
-    if ((talonAfter % 2) != 0) {
-        qWarning() << "[BUG] Talon became odd after refill:"
-                   << "before=" << talonBefore << "after=" << talonAfter;
-    }
-
-    // Both players should draw the same number of cards after each pile capture.
-    if (drewPlayer != drewCpu) {
-        qWarning() << "[BUG] Unequal draws in refillHands:"
-                   << "drewPlayer=" << drewPlayer << "drewCpu=" << drewCpu
-                   << "firstDraws=" << (firstDraws == Winner::Player ? "Player" : "CPU")
-                   << "talonBefore=" << talonBefore << "talonAfter=" << talonAfter
-                   << "handBefore(P,C)=" << pBefore << cBefore
-                   << "handAfter(P,C)=" << m_player.size() << m_cpu.size();
-    }
-
-    // Hand sizes should match after refill (normally equal in 2-player play).
-    if (m_player.size() != m_cpu.size()) {
-        qWarning() << "[BUG] Hand sizes diverged after refill:"
-                   << "player=" << m_player.size() << "cpu=" << m_cpu.size()
-                   << "talonAfter=" << talonAfter;
-    }
-}
-
-bool GameEngine::isHitRank(int rank) const
-{
-    // hit matches FIRST card of pile, or is a 7
-    return (m_cardToHit >= 0) && (rank == m_cardToHit || rank == 7);
-}
-
-bool GameEngine::handHasHitCard(const QVector<Card>& hand) const
-{
-    if (m_cardToHit < 0) return false;
-    for (const Card& c : hand) {
-        if (c.rank == m_cardToHit || c.rank == 7)
-            return true;
-    }
-    return false;
+    if (!playerInputEnabled())
+        return false;
+    const std::vector<int> moves = m_core.legalMoves(0);
+    return std::find(moves.begin(), moves.end(), handIndex) != moves.end();
 }
 
 void GameEngine::newGame()
 {
+    ++m_gameGeneration;
     m_aiTimer.stop();
-    m_pileTimer.stop();
+    m_capturePauseTimer.stop();
+    m_visualWatchdog.stop();
+    m_core.setPlayerCount(m_configuredPlayerCount);
+    m_core.newGame();
+    persistGame();
+    m_lastTrick.clear();
+    emit lastTrickChanged();
+    emit scoreChanged();
+    emit roundResultChanged();
+    const QVariantList dealt = initialDealList(m_core);
+    setVisualPhase(VisualPhase::Deal);
+    emit stateChanged();
+    const quint64 generation = m_gameGeneration;
+    QTimer::singleShot(0, this, [this, dealt, generation]() {
+        if (generation == m_gameGeneration && m_visualPhase == VisualPhase::Deal)
+            requestDealAnimation(dealt, 0);
+    });
+}
 
-    m_inputLocked = false;
-    m_pilePending = false;
-
-    m_playerWon.clear();
-    m_cpuWon.clear();
-    m_table.clear();
-    m_player.clear();
-    m_cpu.clear();
+void GameEngine::start()
+{
+    ++m_gameGeneration;
+    m_aiTimer.stop();
+    m_capturePauseTimer.stop();
+    m_visualWatchdog.stop();
+    if (!restoreGame()) {
+        newGame();
+        return;
+    }
 
     m_lastTrick.clear();
-    m_roundResult.clear();
-
-    m_playerPoints = 0;
-    m_cpuPoints = 0;
-
-    m_turn = Turn::Player;
-
-    m_cardToHit = -1;
-    m_haveToMove = true;
-    m_movesInPile = 0;
-    m_roundStarter = Turn::Player;
-    m_lastHitter = Winner::Player;
-
-    m_lastPlayedWasSeven = false;
-    m_lastPlayedBy = Turn::Player;
-
-    m_lastPileWinner = Winner::Player;
-
-    initDeck();
-    refillHands(Winner::Player);
-
-    updateStatusText();
-
-    emit statusChanged();
     emit lastTrickChanged();
-    emit roundResultChanged();
     emit scoreChanged();
+    emit roundResultChanged();
+    setVisualPhase(VisualPhase::Idle);
     emit stateChanged();
+    if (m_core.pilePending())
+        startCapturePause();
+    else
+        scheduleAiMove();
 }
 
 void GameEngine::playCard(int handIndex)
 {
-
-    // If "Let go" is offered, only HIT cards are legal plays (otherwise use Let go).
-    if (canLeave()) {
-        if (handIndex < 0 || handIndex >= m_player.size()) return;
-        const Card& c = m_player[handIndex];
-        if (!isHitRank(c.rank)) return;
-    }
-
-    if (!m_roundResult.isEmpty()) return;
-    if (!playerInputEnabled()) return;
-
-    m_inputLocked = true;
-    emit stateChanged();
-
-    applyMove(Turn::Player, handIndex);
-
-    if (!m_pilePending) {
-        m_inputLocked = false;
-        emit stateChanged();
+    if (!isPlayerCardPlayable(handIndex))
+        return;
+    const Zsirozas::Card card = m_core.hand(0)[static_cast<std::size_t>(handIndex)];
+    if (m_core.playCard(0, handIndex)) {
+        persistGame();
+        requestCardAnimation(cardId(card), 0, handIndex);
     }
 }
 
 void GameEngine::playerLeave()
 {
-    if (!canLeave())
-        return;
-
-    // leaving ends pile immediately; winner is last hitter
-    scheduleRoundWin(m_lastHitter);
+    if (m_visualPhase == VisualPhase::Idle && m_core.leave(0)) {
+        persistGame();
+        startCapturePause();
+    }
 }
 
-void GameEngine::applyMove(Turn who, int handIndex)
+void GameEngine::requestCardAnimation(const QString& id, int player, int oldHandIndex)
 {
-    QVector<Card>& hand = (who == Turn::Player) ? m_player : m_cpu;
-    if (handIndex < 0 || handIndex >= hand.size()) return;
-
-    // Cancel any scheduled actions; a real play is happening now
     m_aiTimer.stop();
-    m_pileTimer.stop();
-    m_pilePending = false;
-
-    Card played = hand.takeAt(handIndex);
-    played.playedBy = (who == Turn::Cpu) ? 1 : 0;
-    m_table.append(played);
-
-    // Endgame special tracking (from your previous engine)
-    m_lastPlayedWasSeven = (played.rank == 7);
-    m_lastPlayedBy = who;
-
-////    qDebug() << "[applyMove]" << (who == Turn::Player ? "Player" : "CPU")
-////             << "played" << played.rank << "tableSizeNow=" << m_table.size();
-
-    advanceAfterPlay(who, played.rank);
-}
-
-void GameEngine::advanceAfterPlay(Turn whoJustPlayed, int playedRank)
-{
-    m_movesInPile++;
-
-    // First card defines pile
-    if (m_movesInPile == 1) {
-        m_cardToHit = playedRank;
-        m_roundStarter = whoJustPlayed;
-        m_lastHitter = (whoJustPlayed == Turn::Player) ? Winner::Player : Winner::Cpu;
-
-        m_haveToMove = true;
-
-        // Next player must respond
-        m_turn = (whoJustPlayed == Turn::Player) ? Turn::Cpu : Turn::Player;
-
-        updateStatusText();
-        emit statusChanged();
-        emit stateChanged();
-
-        // After the first card, the next player is in forced-hit phase.
-        // If they have no legal hit, auto-win goes to last hitter (the starter).
-        const QVector<Card>& responderHand = (m_turn == Turn::Player) ? m_player : m_cpu;
-        if (responderHand.isEmpty()) {
-            scheduleRoundWin(m_lastHitter);
-            return;
-        }
-
-        maybeScheduleCpuMove();
-        return;
-    }
-
-    // Update last hitter if this was a hit
-    if (isHitRank(playedRank)) {
-        m_lastHitter = (whoJustPlayed == Turn::Player) ? Winner::Player : Winner::Cpu;
-    }
-
-    // If this play was NOT a hit (and it's not the opening lead), the pile ends now.
-    // Winner is the last hitter.
-    if (m_movesInPile >= 2 && !isHitRank(playedRank)) {
-        scheduleRoundWin(m_lastHitter);
-        return;
-    }
-
-    // Advance turn
-    m_turn = (whoJustPlayed == Turn::Player) ? Turn::Cpu : Turn::Player;
-
-    // In 2-player, “round end” is simply “back to starter”
-    const bool backToStarter = (m_turn == m_roundStarter);
-
-    if (backToStarter) {
-        // Starter decision phase
-        m_haveToMove = false;
-
-        // If starter is also the last hitter, pile is auto-won
-        const Winner starterW = (m_roundStarter == Turn::Player) ? Winner::Player : Winner::Cpu;
-        if (m_lastHitter == starterW) {
-            scheduleRoundWin(m_lastHitter);
-            return;
-        }
-
-        // If starter cannot hit cardToHit, auto-win for last hitter
-        const QVector<Card>& starterHand = (m_roundStarter == Turn::Player) ? m_player : m_cpu;
-        if (!handHasHitCard(starterHand)) {
-            scheduleRoundWin(m_lastHitter);
-            return;
-        }
-
-        // Otherwise starter gets choice: play any card OR leave
-        updateStatusText();
-        emit statusChanged();
-        emit stateChanged();
-
-        maybeScheduleCpuMove();
-        return;
-    }
-
-    updateStatusText();
-    emit statusChanged();
+    setVisualPhase(VisualPhase::CardFlight);
     emit stateChanged();
-
-    maybeScheduleCpuMove();
+    emit cardAnimationRequested(id, player, oldHandIndex);
+    if (m_animationsEnabled)
+        startWatchdog(5000);
+    else
+        QTimer::singleShot(0, this, &GameEngine::completeCardAnimation);
 }
 
-void GameEngine::scheduleRoundWin(Winner winner)
+void GameEngine::completeCardAnimation()
 {
-    if (m_table.isEmpty())
+    if (m_visualPhase != VisualPhase::CardFlight)
         return;
-
-    m_aiTimer.stop();
-
-    m_pendingWinner = winner;
-    m_pilePending = true;
-    m_inputLocked = true;
-
-    if (m_table.size() == 1) {
-        qWarning() << "[BUG-scheduleRoundWin()] Attempted to resolve a 1-card pile; refusing.";
+    m_visualWatchdog.stop();
+    if (m_core.pilePending()) {
+        startCapturePause();
         return;
     }
+    finishVisualPhase();
+}
 
-    resolvePileAfterDelay();
+void GameEngine::startCapturePause()
+{
+    setVisualPhase(VisualPhase::CapturePause);
     emit stateChanged();
+    m_capturePauseTimer.start(m_animationsEnabled ? 320 : 0);
 }
 
-void GameEngine::resolvePileAfterDelay()
+void GameEngine::requestPileAnimation()
 {
-////    qDebug() << "[resolvePileAfterDelay] pending=" << m_pilePending
-////             << "winner=" << (m_pendingWinner == Winner::Player ? "Player" : "CPU")
-////             << "delay=" << m_pileDelayMs;
-
-    m_pileTimer.stop();
-    m_pileTimer.start(m_pileDelayMs);
-}
-
-void GameEngine::commitPile()
-{
-////    qDebug() << "[pileTimer timeout] pending=" << m_pilePending << "tableSize=" << m_table.size();
-
-    if (!m_pilePending)
+    if (m_visualPhase != VisualPhase::CapturePause || !m_core.pilePending())
         return;
-
-    if (m_table.isEmpty()) {
-        m_pilePending = false;
-        m_inputLocked = false;
-        emit stateChanged();
-        return;
-    }
-
-    const Winner winner = m_pendingWinner;
-    m_pilePending = false;
-
-    if (m_table.size() == 1) {
-        qWarning() << "[BUG-commitPile()] Attempted to resolve a 1-card pile; refusing.";
-        return;
-    }
-
-    capturePile(winner);
-
-    // Start next pile with the winner as leader
-    startNextPileWithLeader(winner);
-
-    if (isGameOverCondition()) {
-        finishGame();
-        m_inputLocked = false;
-        updateStatusText();
-        emit statusChanged();
-        emit stateChanged();
-        return;
-    }
-
-    m_inputLocked = false;
-    updateStatusText();
-    emit statusChanged();
+    setVisualPhase(VisualPhase::PileFlight);
     emit stateChanged();
-
-    maybeScheduleCpuMove();
+    emit pileAnimationRequested(m_core.pendingWinner());
+    if (m_animationsEnabled)
+        startWatchdog(8000);
+    else
+        QTimer::singleShot(0, this, &GameEngine::completePileAnimation);
 }
 
-void GameEngine::capturePile(Winner winner)
+void GameEngine::completePileAnimation()
 {
-    int z = 0;
-    for (const Card& c : m_table) {
-        if (c.isZsir())
-            z += 10;
-    }
-
-    if (winner == Winner::Player) {
-        m_playerPoints += z;
-        m_playerWon += m_table;
-        m_lastPileWinner = Winner::Player;
-        m_lastTrick = QStringLiteral("You won the trick");
-    } else {
-        m_cpuPoints += z;
-        m_cpuWon += m_table;
-        m_lastPileWinner = Winner::Cpu;
-        m_lastTrick = QStringLiteral("AI won the trick");
-    }
-
-    m_table.clear();
-    refillHands(winner);
-
-    emit scoreChanged();
+    if (m_visualPhase != VisualPhase::PileFlight)
+        return;
+    m_visualWatchdog.stop();
+    const Zsirozas::CaptureResult capture = m_core.commitPile();
+    persistGame();
+    m_lastTrick = tr("%1 won the pile").arg(playerDisplayName(capture.winnerPlayer));
     emit lastTrickChanged();
-}
-
-void GameEngine::startNextPileWithLeader(Winner leader)
-{
-    // Reset pile state
-    m_cardToHit = -1;
-    m_movesInPile = 0;
-    m_haveToMove = true;
-
-    m_turn = (leader == Winner::Player) ? Turn::Player : Turn::Cpu;
-
-    // If the leader has no cards, give turn to the other player (if they do have cards)
-    if (m_turn == Turn::Player && m_player.isEmpty() && !m_cpu.isEmpty())
-        m_turn = Turn::Cpu;
-    else if (m_turn == Turn::Cpu && m_cpu.isEmpty() && !m_player.isEmpty())
-        m_turn = Turn::Player;
-
-    m_roundStarter = m_turn;
-    m_lastHitter = leader;
-}
-
-void GameEngine::maybeScheduleCpuMove()
-{
-    if (m_turn != Turn::Cpu) return;
-    if (!m_roundResult.isEmpty()) return;
-    if (m_pilePending) return;
-    if (m_cpu.isEmpty()) {
-        // If there's an active pile, resolve it to last hitter.
-        if (!m_table.isEmpty() && !m_pilePending) {
-            scheduleRoundWin(m_lastHitter);
-        } else {
-            // No pile: if player still has cards, give them the turn; else finish.
-            if (!m_player.isEmpty()) {
-                m_turn = Turn::Player;
-                emit stateChanged();
-            } else if (isGameOverCondition()) {
-                finishGame();
-            }
-        }
+    emit scoreChanged();
+    emit roundResultChanged();
+    const QVariantList dealt = drawList(capture.drawn);
+    if (!dealt.isEmpty() && !capture.gameOver) {
+        setVisualPhase(VisualPhase::Deal);
+        emit stateChanged();
+        requestDealAnimation(dealt, capture.winnerPlayer);
         return;
     }
+    finishVisualPhase();
+}
 
+void GameEngine::requestDealAnimation(const QVariantList& cards, int firstPlayer)
+{
+    if (m_visualPhase != VisualPhase::Deal)
+        return;
+    emit dealAnimationRequested(cards, firstPlayer);
+    if (m_animationsEnabled)
+        startWatchdog(10000);
+    else
+        QTimer::singleShot(0, this, &GameEngine::completeDealAnimation);
+}
+
+void GameEngine::completeDealAnimation()
+{
+    if (m_visualPhase != VisualPhase::Deal)
+        return;
+    m_visualWatchdog.stop();
+    finishVisualPhase();
+}
+
+void GameEngine::finishVisualPhase()
+{
+    setVisualPhase(VisualPhase::Idle);
+    emit stateChanged();
+    scheduleAiMove();
+}
+
+void GameEngine::scheduleAiMove()
+{
     m_aiTimer.stop();
+    if (m_paused || m_visualPhase != VisualPhase::Idle || m_core.roundResult() != RoundResult::None
+        || m_core.pilePending() || m_core.turn() == 0)
+        return;
     m_aiTimer.start(m_aiPlayDelay);
 }
 
-QVector<int> GameEngine::legalCpuMoves() const
+void GameEngine::performAiMove()
 {
-    QVector<int> legal;
-    legal.reserve(m_cpu.size());
-
-    if (m_cpu.isEmpty())
-        return legal;
-
-    // First move of pile: any card is legal
-    if (m_movesInPile == 0) {
-        for (int i = 0; i < m_cpu.size(); ++i)
-            legal.append(i);
-        return legal;
-    }
-
-    // If CPU has at least one hit card, only hit cards are legal
-    if (handHasHitCard(m_cpu)) {
-        for (int i = 0; i < m_cpu.size(); ++i) {
-            if (isHitRank(m_cpu[i].rank))
-                legal.append(i);
+    const int player = m_core.turn();
+    if (m_paused || m_visualPhase != VisualPhase::Idle || m_core.roundResult() != RoundResult::None
+        || player <= 0 || player >= m_core.playerCount())
+        return;
+    const AiAction action = m_core.chooseAiAction(
+        player, static_cast<AiDifficulty>(difficultyForPlayer(player)));
+    if (action.type == AiActionType::Leave) {
+        if (m_core.leave(player)) {
+            persistGame();
+            startCapturePause();
         }
-        return legal;
+        return;
     }
-
-    // Otherwise, any card can be thrown
-    for (int i = 0; i < m_cpu.size(); ++i)
-        legal.append(i);
-
-    return legal;
+    if (action.type != AiActionType::Play || action.handIndex < 0
+        || action.handIndex >= static_cast<int>(m_core.hand(player).size())) {
+        qWarning() << "No legal AI action for player" << player;
+        return;
+    }
+    const Zsirozas::Card card = m_core.hand(player)[static_cast<std::size_t>(action.handIndex)];
+    if (m_core.playCard(player, action.handIndex)) {
+        persistGame();
+        requestCardAnimation(cardId(card), player, action.handIndex);
+    }
 }
 
-int GameEngine::scoreCpuMove(int handIndex, bool stronger) const
+void GameEngine::setVisualPhase(VisualPhase phase)
 {
-    if (handIndex < 0 || handIndex >= m_cpu.size())
-        return -1000000;
-
-    const Card& c = m_cpu[handIndex];
-    const bool openingLead = (m_movesInPile == 0);
-    const bool hit = (!openingLead && isHitRank(c.rank));
-    const bool seven = (c.rank == 7);
-    const bool zsir = c.isZsir();
-
-    int score = 0;
-
-    if (openingLead) {
-        // Do not lead with valuable cards unless needed
-        if (seven) score -= (stronger ? 30 : 18);
-        if (zsir)  score -= (stronger ? 22 : 10);
-
-        // Prefer low / disposable cards as openers
-        score += (15 - c.rank);
-
-        // Small bonus if we keep duplicate ranks in hand
-        int sameRank = 0;
-        for (const Card& other : m_cpu)
-            if (other.rank == c.rank) ++sameRank;
-        if (sameRank >= 2) score += 8;
-    } else {
-        if (hit) score += 100;
-
-        // Prefer natural hit over spending a 7
-        if (c.rank == m_cardToHit) score += 25;
-        if (seven) score -= (stronger ? 20 : 10);
-
-        // Capturing zsírs is valuable
-        int pileZsir = 0;
-        for (const Card& t : m_table)
-            if (t.isZsir()) pileZsir += 10;
-        if (hit) score += pileZsir * (stronger ? 4 : 3);
-
-        // Avoid throwing valuable cards into opponent's likely capture
-        if (!hit && zsir) score -= (stronger ? 35 : 20);
+    if (m_visualPhase == phase) {
+        updateStatusText();
+        return;
     }
-
-    return score;
-}
-
-int GameEngine::chooseCpuIndexEasy(const QVector<int>& legal) const
-{
-    if (legal.isEmpty())
-        return -1;
-
-    // Easy: random legal move, with only a soft bias toward actual hits
-    QVector<int> bag = legal;
-    for (int idx : legal) {
-        if (m_movesInPile > 0 && isHitRank(m_cpu[idx].rank))
-            bag.append(idx);
-    }
-
-    std::uniform_int_distribution<int> dist(0, bag.size() - 1);
-    return bag[dist(rng)];
-}
-
-int GameEngine::chooseCpuIndexNormal(const QVector<int>& legal, bool stronger) const
-{
-    if (legal.isEmpty())
-        return -1;
-
-    int best = legal.first();
-    int bestScore = scoreCpuMove(best, stronger);
-
-    QVector<int> ties;
-    ties.append(best);
-
-    for (int i = 1; i < legal.size(); ++i) {
-        const int idx = legal[i];
-        const int s = scoreCpuMove(idx, stronger);
-
-        if (s > bestScore) {
-            best = idx;
-            bestScore = s;
-            ties.clear();
-            ties.append(idx);
-        } else if (s == bestScore) {
-            ties.append(idx);
-        }
-    }
-
-    if (ties.size() > 1) {
-        std::uniform_int_distribution<int> dist(0, ties.size() - 1);
-        return ties[dist(rng)];
-    }
-
-    return best;
-}
-
-int GameEngine::chooseCpuIndex() const
-{
-    if (m_cpu.isEmpty())
-        return -1;
-
-    const QVector<int> legal = legalCpuMoves();
-    if (legal.isEmpty())
-        return -1;
-
-    switch (static_cast<AiDifficulty>(m_aiDifficulty)) {
-    case AiDifficulty::Easy:
-        return chooseCpuIndexEasy(legal);
-    case AiDifficulty::Normal:
-        return chooseCpuIndexNormal(legal, false);
-    case AiDifficulty::Hard:
-        return chooseCpuIndexNormal(legal, true);
-    case AiDifficulty::Expert:
-        return chooseCpuIndexNormal(legal, true); // phase 1: same as Hard
-    }
-
-    return chooseCpuIndexNormal(legal, false);
+    m_visualPhase = phase;
+    updateStatusText();
+    emit visualPhaseChanged();
 }
 
 void GameEngine::updateStatusText()
 {
-    if (!m_roundResult.isEmpty()) {
-        m_status.clear();
-        return;
-    }
-
-    if (m_pilePending) {
-        m_status = QStringLiteral("Resolving...");
-        return;
-    }
-
-    if (m_turn == Turn::Player) {
-        if (m_movesInPile == 0)
-            m_status = QStringLiteral("Your turn (lead)");
-        else if (m_haveToMove)
-            m_status = QStringLiteral("Your turn (hit %1 or 7)").arg(m_cardToHit);
+    QString next;
+    if (m_core.roundResult() != RoundResult::None) {
+        next.clear();
+    } else if (m_visualPhase == VisualPhase::Deal) {
+        next = tr("Dealing...");
+    } else if (m_visualPhase == VisualPhase::CapturePause || m_visualPhase == VisualPhase::PileFlight) {
+        next = tr("Resolving...");
+    } else if (m_visualPhase == VisualPhase::CardFlight) {
+        next = tr("Playing...");
+    } else if (m_core.turn() == 0) {
+        if (m_core.movesInPile() == 0)
+            next = tr("%1's turn (lead)").arg(playerDisplayName(0));
+        else if (m_core.canLeave(0))
+            next = tr("Your turn (hit or let it go)");
+        else if (m_core.handHasHitCard(0))
+            next = tr("Your turn (hit or discard)");
         else
-            m_status = QStringLiteral("Your turn (play or leave)");
+            next = tr("Your turn (discard)");
     } else {
-        if (m_movesInPile == 0)
-            m_status = QStringLiteral("AI turn (lead)");
-        else if (m_haveToMove)
-            m_status = QStringLiteral("AI turn (must hit)");
+        const QString name = playerDisplayName(m_core.turn());
+        if (m_core.movesInPile() == 0)
+            next = tr("%1 is leading...").arg(name);
+        else if (m_core.canLeave(m_core.turn()))
+            next = tr("%1 is deciding...").arg(name);
         else
-            m_status = QStringLiteral("AI turn (decision)");
+            next = tr("%1 is playing...").arg(name);
     }
+    if (m_status == next)
+        return;
+    m_status = next;
+    emit statusChanged();
 }
 
-bool GameEngine::isGameOverCondition() const
+void GameEngine::startWatchdog(int milliseconds) { m_visualWatchdog.start(milliseconds); }
+
+void GameEngine::persistGame()
 {
-    return m_talon.isEmpty() && m_player.isEmpty() && m_cpu.isEmpty() && m_table.isEmpty()
-        && !m_pilePending;
+    QSettings settings(autosaveSettingsPath(), QSettings::NativeFormat);
+    settings.setValue(autosaveKey, QByteArray::fromStdString(m_core.serializeState()));
+    settings.sync();
 }
 
-void GameEngine::finishGame()
+bool GameEngine::restoreGame()
 {
-    // Special rule preserved from your earlier engine:
-    // if the last played card of the whole game is a 7, that player loses regardless.
-    if (m_lastPlayedWasSeven) {
-        const bool lastByPlayer = (m_lastPlayedBy == Turn::Player);
-        m_roundResult = lastByPlayer ? QStringLiteral("You lost the round")
-                                     : QStringLiteral("You won the round");
-        emit roundResultChanged();
-        return;
+    QSettings settings(autosaveSettingsPath(), QSettings::NativeFormat);
+    const QByteArray saved = settings.value(autosaveKey).toByteArray();
+    if (!saved.isEmpty() && m_core.restoreState(saved.toStdString()))
+        return true;
+    if (!saved.isEmpty()) {
+        settings.remove(autosaveKey);
+        settings.sync();
     }
+    return false;
+}
 
-    if (m_playerPoints > m_cpuPoints) {
-        m_roundResult = QStringLiteral("You won the round");
-    } else if (m_cpuPoints > m_playerPoints) {
-        m_roundResult = QStringLiteral("AI won the round");
-    } else {
-        // 40–40: last pile winner wins
-        m_roundResult = (m_lastPileWinner == Winner::Player)
-            ? QStringLiteral("You won the round")
-            : QStringLiteral("AI won the round");
+void GameEngine::recoverTimedOutVisualPhase()
+{
+    qWarning() << "Visual phase watchdog recovered phase" << visualPhase();
+    switch (m_visualPhase) {
+    case VisualPhase::CardFlight: completeCardAnimation(); break;
+    case VisualPhase::CapturePause: requestPileAnimation(); break;
+    case VisualPhase::PileFlight: completePileAnimation(); break;
+    case VisualPhase::Deal: completeDealAnimation(); break;
+    case VisualPhase::Idle: break;
     }
-
-    emit roundResultChanged();
 }

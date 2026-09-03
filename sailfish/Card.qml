@@ -1,3 +1,21 @@
+/*
+    Copyright (C) 2026 edp17 and chatGPT
+
+    This file is part of harbour-zsirozas.
+
+    The harbour-zsirozas is free software: you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+
+    The harbour-zsirozas is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with the harbour-zsirozas. If not, see <http://www.gnu.org/licenses/>.
+*/
 import QtQuick 2.6
 import Sailfish.Silica 1.0
 import QtGraphicalEffects 1.0
@@ -6,6 +24,7 @@ Item {
     id: root
     property bool pressed: false
     property bool faceUp: true
+    property string cardStyle: "Piatnik"
     width: Theme.itemSizeLarge * 1.4
     height: width * 1.4
 
@@ -25,7 +44,9 @@ Item {
     Image {
         id: cardBackImage
         anchors.fill: parent
-        source: Qt.resolvedUrl("../images/cards/back.png")
+        source: Qt.resolvedUrl(root.cardStyle === "Betyar"
+                               ? "../images/cards/betyar_back.png"
+                               : "../images/cards/back.png")
         fillMode: Image.PreserveAspectFit
         smooth: true
         visible: !root.faceUp
@@ -37,7 +58,9 @@ Item {
         anchors.fill: parent
         fillMode: Image.PreserveAspectFit
         source: root.faceUp
-                ? Qt.resolvedUrl("../images/cards/card-" + cardId + ".png")
+                ? Qt.resolvedUrl("../images/cards/"
+                                 + (root.cardStyle === "Betyar" ? "betyar_card_" : "card-")
+                                 + cardId + ".png")
                 : ""
         smooth: true
         visible: root.faceUp
